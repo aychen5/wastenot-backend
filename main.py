@@ -14,6 +14,21 @@ SUPABASE_URL = os.environ["VITE_SUPABASE_URL"]
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]  # keep server-side only
 sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
+from fastapi.middleware.cors import CORSMiddleware
+
+origins = [
+    "https://your-lovable-app.lovable.app",
+    "http://localhost:3000",  # for local testing
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Example EF lookup table in Supabase (table: emission_factors)
 # columns: name (pk), landfill_mtco2e_ton, compost_mtco2e_ton
 
