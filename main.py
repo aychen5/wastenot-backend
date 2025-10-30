@@ -1,10 +1,15 @@
 # app.py
 import os
+import logging
 from typing import List, Optional, Dict
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from supabase import create_client, Client
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
@@ -210,19 +215,28 @@ def meal_emissions(req: MealEmissionsRequest):
     db_error = None
     db_row_id = None
     try:
-        db_row = sb.table("emissions_results").insert({
+        insert_data = {
             "user_id": req.userId,
             "session_id": req.session_id,
+            "meal_name": meal_name,
+            "leftover_g": meal_leftover_g,
             "items": [i.model_dump() for i in items_out],
             "totals": totals.model_dump(),
             "source": "meal_emissions",
             "warm_version": "v16",
-            "meal_name": meal_name,
-        }).execute()
-        if db_row.data:
+        }
+        logger.info(f"Inserting into emissions_results: {insert_data}")
+        db_row = sb.table("emissions_results").insert(insert_data).execute()
+        logger.info(f"Database response: {db_row}")
+        if db_row.data and len(db_row.data) > 0:
             db_row_id = db_row.data[0].get("id")
+            logger.info(f"Successfully inserted row with id: {db_row_id}")
+        else:
+            logger.warning("Database insert returned no data")
+            db_error = "Insert returned no data"
     except Exception as e:
         db_error = str(e)
+        logger.error(f"Database insert error: {e}", exc_info=True)
 
     return ComputeResponse(
         session_id=req.session_id,
@@ -296,19 +310,28 @@ def calculate_emissions(data: Payload):
     db_error = None
     db_row_id = None
     try:
-        db_row = sb.table("emissions_results").insert({
+        insert_data = {
             "user_id": data.userId,
             "session_id": data.session_id,
+            "leftover_g": total_leftover_g,
             "items": [i.model_dump() for i in items_out],
             "totals": totals.model_dump(),
             "source": "lovable",
             "warm_version": "v16"
-        }).execute()
-        if db_row.data:
+        }
+        logger.info(f"Inserting into emissions_results: {insert_data}")
+        db_row = sb.table("emissions_results").insert(insert_data).execute()
+        logger.info(f"Database response: {db_row}")
+        if db_row.data and len(db_row.data) > 0:
             db_row_id = db_row.data[0].get("id")
+            logger.info(f"Successfully inserted row with id: {db_row_id}")
+        else:
+            logger.warning("Database insert returned no data")
+            db_error = "Insert returned no data"
     except Exception as e:
         # don't fail the request; return results and an error string
         db_error = str(e)
+        logger.error(f"Database insert error: {e}", exc_info=True)
 
     return ComputeResponse(
         session_id=data.session_id,
@@ -328,3 +351,23 @@ def health():
 @app.get("/")
 def root():
     return {"ok": True, "service": "WasteNotNYC Emissions API"}
+
+@app.get("/test-db")
+def test_db():
+    """Test endpoint to verify database connection and table structure."""
+    try:
+        # Try to query the emissions_results table
+        result = sb.table("emissions_results").select("*").limit(1).execute()
+        return {
+            "ok": True,
+            "table_exists": True,
+            "sample_count": len(result.data) if result.data else 0,
+            "columns": list(result.data[0].keys()) if result.data and len(result.data) > 0 else "No rows to inspect"
+        }
+    except Exception as e:
+        logger.error(f"Database test error: {e}", exc_info=True)
+        return {
+            "ok": False,
+            "error": str(e),
+            "table_exists": False
+        }
