@@ -103,6 +103,12 @@ class MealEmissionsRequest(BaseModel):
     userId: Optional[str] = None
 
 
+@app.options("/meal-emissions")
+def meal_emissions_options():
+    """Handle CORS preflight for meal-emissions endpoint."""
+    return {"message": "OK"}
+
+
 @app.post("/meal-emissions", response_model=ComputeResponse)
 def meal_emissions(req: MealEmissionsRequest):
     """Compute emissions for a meal item using preset components and category factors."""
@@ -249,6 +255,12 @@ def meal_emissions(req: MealEmissionsRequest):
     )
 
 # ----- Core endpoint -----
+@app.options("/calculate-emissions")
+def calculate_emissions_options():
+    """Handle CORS preflight for calculate-emissions endpoint."""
+    return {"message": "OK"}
+
+
 @app.post("/calculate-emissions", response_model=ComputeResponse)
 def calculate_emissions(data: Payload):
     preload_factors()  # ensure cache is ready
