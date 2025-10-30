@@ -2,7 +2,7 @@
 import os
 import logging
 from typing import List, Optional, Dict
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from supabase import create_client, Client
@@ -20,13 +20,17 @@ sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 app = FastAPI(title="WasteNotNYC Emissions API", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
+    allow_origin_regex=r"https://.*\.lovable\.app",
     allow_origins=[
-    "https://a74f6327-764b-47f2-8e5a-0cf826e093a1.lovable.app",
-    "http://localhost:3000",  # for local testing
+        "https://a74f6327-764b-47f2-8e5a-0cf826e093a1.lovable.app",
+        "http://localhost:3000",  # for local testing
+        "http://localhost:5173",  # common Vite dev server port
     ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=3600,
 )
 
 
@@ -104,9 +108,13 @@ class MealEmissionsRequest(BaseModel):
 
 
 @app.options("/meal-emissions")
-def meal_emissions_options():
+async def meal_emissions_options(request: Request):
     """Handle CORS preflight for meal-emissions endpoint."""
-    return {"message": "OK"}
+    origin = request.headers.get("origin")
+    logger.info(f"OPTIONS request received for /meal-emissions from {origin}")
+    # CORS middleware should handle headers, just return empty response
+    response = Response(status_code=204)
+    return response
 
 
 @app.post("/meal-emissions", response_model=ComputeResponse)
@@ -256,9 +264,13 @@ def meal_emissions(req: MealEmissionsRequest):
 
 # ----- Core endpoint -----
 @app.options("/calculate-emissions")
-def calculate_emissions_options():
+async def calculate_emissions_options(request: Request):
     """Handle CORS preflight for calculate-emissions endpoint."""
-    return {"message": "OK"}
+    origin = request.headers.get("origin")
+    logger.info(f"OPTIONS request received for /calculate-emissions from {origin}")
+    # CORS middleware should handle headers, just return empty response
+    response = Response(status_code=204)
+    return response
 
 
 @app.post("/calculate-emissions", response_model=ComputeResponse)
