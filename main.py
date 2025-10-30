@@ -54,7 +54,7 @@ class Totals(BaseModel):
 
 class ComputeResponse(BaseModel):
     session_id: Optional[str] = None
-    meal_name: str
+    meal_name: Optional[str] = None
     leftover_g: float
     items: List[ItemResult]
     totals: Totals
@@ -243,14 +243,23 @@ def calculate_emissions(data: Payload):
     total_landfill = 0.0
     total_compost = 0.0
 
+    total_leftover_g = 0.0
     for comp in data.components:
         f = get_factor(comp.name)
         if not f:
             # no factor found anywhere; record a zero row
             items_out.append(ItemResult(
-                name=comp.name, leftover_g=comp.leftover_g,
-                landfill_kgco2e=0.0, compost_kgco2e=0.0, avoided_kgco2e=0.0
+                component_name=comp.name,
+                category=comp.name,
+                share=1.0,  # single component gets full share
+                component_leftover_g=comp.leftover_g,
+                landfill_kgco2e=0.0,
+                compost_kgco2e=0.0,
+                avoided_kgco2e=0.0,
+                landfill_factor_kg_per_kg=0.0,
+                compost_factor_kg_per_kg=0.0,
             ))
+            total_leftover_g += comp.leftover_g
             continue
 
         landfill_factor = mtco2e_per_ton_to_kg_per_kg(f["landfill_mtco2e_ton"])
@@ -262,12 +271,18 @@ def calculate_emissions(data: Payload):
         avoided  = landfill - compost
 
         items_out.append(ItemResult(
-            name=comp.name,
-            leftover_g=comp.leftover_g,
+            component_name=comp.name,
+            category=comp.name,
+            share=1.0,  # single component gets full share
+            component_leftover_g=comp.leftover_g,
             landfill_kgco2e=round(landfill, 6),
             compost_kgco2e=round(compost, 6),
             avoided_kgco2e=round(avoided, 6),
+            landfill_factor_kg_per_kg=round(landfill_factor, 6),
+            compost_factor_kg_per_kg=round(compost_factor, 6),
         ))
+        
+        total_leftover_g += comp.leftover_g
 
         total_landfill += landfill
         total_compost  += compost
@@ -296,8 +311,9 @@ def calculate_emissions(data: Payload):
         db_error = str(e)
 
     return ComputeResponse(
-        user_id=data.userId,
         session_id=data.session_id,
+        meal_name=None,  # not applicable for this endpoint
+        leftover_g=total_leftover_g,
         items=items_out,
         totals=totals,
         db_row_id=db_row_id,
