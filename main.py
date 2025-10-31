@@ -44,6 +44,7 @@ class Payload(BaseModel):
     session_id: Optional[str] = None
     components: List[Component] = Field(..., min_items=1)
     selected_items: Optional[List[str]] = Field(None, description="List of item names selected from items table (e.g., ['Garden Salad', 'Tea'])")
+    packaging_item_ids: Optional[List[str]] = Field(None, description="List of packaging item IDs from packaging_items table")
 
 
 class ItemResult(BaseModel):
@@ -61,6 +62,8 @@ class Totals(BaseModel):
     landfill_kgco2e: float
     compost_kgco2e: float
     avoided_kgco2e: float
+    avoided_kgco2e_food: float
+    avoided_kgco2e_packaging: float
 
 class ComputeResponse(BaseModel):
     session_id: Optional[str] = None
@@ -85,7 +88,7 @@ def preload_factors():
     if _factor_cache:
         return
     res = sb.table("emission_factors").select(
-        "name,landfill_mtco2e_ton,compost_mtco2e_ton,leftover_percentage"
+        "name,landfill_mtco2e_ton,compost_mtco2e_ton,recycle_mtco2e_ton,leftover_percentage"
     ).execute()
     for r in (res.data or []):
         _factor_cache[r["name"]] = r
@@ -100,12 +103,26 @@ def get_factor(name: str) -> Optional[Dict]:
         or _factor_cache.get("Food Waste")
     )
 
+def load_packaging_items(packaging_item_ids: Optional[List[str]]) -> List[Dict]:
+    """Load packaging items from packaging_items table by IDs."""
+    if not packaging_item_ids:
+        return []
+    try:
+        res = sb.table("packaging_items").select(
+            "id,name,grams,emission_factor_category"
+        ).in_("id", packaging_item_ids).execute()
+        return res.data or []
+    except Exception as e:
+        logger.error(f"Error loading packaging items: {e}", exc_info=True)
+        return []
+
 
 class MealEmissionsRequest(BaseModel):
     item_id: Optional[str] = None
     item_name: Optional[str] = None
     session_id: Optional[str] = None
     userId: Optional[str] = None
+    packaging_item_ids: Optional[List[str]] = Field(None, description="List of packaging item IDs from packaging_items table")
 
 
 @app.options("/meal-emissions")
@@ -160,6 +177,7 @@ def meal_emissions(req: MealEmissionsRequest):
     items_out: List[ItemResult] = []
     total_landfill = 0.0
     total_compost = 0.0
+    total_food_avoided = 0.0
 
     for c in components:
         comp_name = c.get("component_name") or "Unknown"
@@ -220,11 +238,70 @@ def meal_emissions(req: MealEmissionsRequest):
 
         total_landfill += landfill
         total_compost += compost
+        total_food_avoided += avoided
+
+    # Process packaging items
+    packaging_items = load_packaging_items(req.packaging_item_ids)
+    total_packaging_g = 0.0
+    total_packaging_avoided = 0.0
+    for pkg in packaging_items:
+        pkg_name = pkg.get("name") or "Unknown Packaging"
+        pkg_grams = float(pkg.get("grams") or 0)
+        pkg_category = pkg.get("emission_factor_category") or "Mixed Paper (general)"
+        
+        total_packaging_g += pkg_grams
+        
+        # Get emission factor for packaging category
+        f = get_factor(str(pkg_category))
+        if not f:
+            # If no factor found, treat as zero impact but still include row
+            items_out.append(ItemResult(
+                component_name=pkg_name,
+                category=str(pkg_category),
+                share=1.0,
+                component_leftover_g=pkg_grams,
+                landfill_kgco2e=0.0,
+                compost_kgco2e=0.0,  # Using compost_kgco2e field to store recycle_kgco2e for packaging
+                avoided_kgco2e=0.0,
+                landfill_factor_kg_per_kg=0.0,
+                compost_factor_kg_per_kg=0.0,  # Storing recycle factor here for packaging
+            ))
+            continue
+        
+        # For packaging, use landfill_mtco2e_ton and recycle_mtco2e_ton
+        landfill_factor = mtco2e_per_ton_to_kg_per_kg(f["landfill_mtco2e_ton"]) if f.get("landfill_mtco2e_ton") is not None else 0.0
+        recycle_factor = mtco2e_per_ton_to_kg_per_kg(f["recycle_mtco2e_ton"]) if f.get("recycle_mtco2e_ton") is not None else 0.0
+        
+        kg = pkg_grams / 1000.0
+        landfill = kg * landfill_factor
+        recycle = kg * recycle_factor  # Stored in compost_kgco2e field
+        avoided = landfill - recycle
+        
+        items_out.append(ItemResult(
+            component_name=pkg_name,
+            category=str(pkg_category),
+            share=1.0,
+            component_leftover_g=pkg_grams,
+            landfill_kgco2e=round(landfill, 6),
+            compost_kgco2e=round(recycle, 6),  # Storing recycle emissions here for packaging
+            avoided_kgco2e=round(avoided, 6),
+            landfill_factor_kg_per_kg=round(landfill_factor, 6),
+            compost_factor_kg_per_kg=round(recycle_factor, 6),  # Storing recycle factor here
+        ))
+        
+        total_landfill += landfill
+        total_compost += recycle  # Add recycle emissions to compost total (representing recycling)
+        total_packaging_avoided += avoided
+
+    # Add packaging grams to meal leftover grams
+    meal_leftover_g_with_packaging = meal_leftover_g + total_packaging_g
 
     totals = Totals(
         landfill_kgco2e=round(total_landfill, 6),
         compost_kgco2e=round(total_compost, 6),
-        avoided_kgco2e=round(total_landfill - total_compost, 6),
+        avoided_kgco2e=round(total_food_avoided + total_packaging_avoided, 6),
+        avoided_kgco2e_food=round(total_food_avoided, 6),
+        avoided_kgco2e_packaging=round(total_packaging_avoided, 6),
     )
 
     db_error = None
@@ -234,7 +311,7 @@ def meal_emissions(req: MealEmissionsRequest):
             "user_id": req.userId,
             "session_id": req.session_id,
             "meal_name": [meal_name] if meal_name else None,
-            "leftover_g": meal_leftover_g,
+            "leftover_g": meal_leftover_g_with_packaging,
             "items": [i.model_dump() for i in items_out],
             "totals": totals.model_dump(),
             "source": "meal_emissions",
@@ -256,7 +333,7 @@ def meal_emissions(req: MealEmissionsRequest):
     return ComputeResponse(
         session_id=req.session_id,
         meal_name=[meal_name] if meal_name else None,
-        leftover_g=meal_leftover_g,
+        leftover_g=meal_leftover_g_with_packaging,
         items=items_out,
         totals=totals,
         db_row_id=db_row_id,
@@ -281,6 +358,7 @@ def calculate_emissions(data: Payload):
     items_out: List[ItemResult] = []
     total_landfill = 0.0
     total_compost = 0.0
+    total_food_avoided = 0.0
 
     total_leftover_g = 0.0
     for comp in data.components:
@@ -325,11 +403,70 @@ def calculate_emissions(data: Payload):
 
         total_landfill += landfill
         total_compost  += compost
+        total_food_avoided += avoided
+
+    # Process packaging items
+    packaging_items = load_packaging_items(data.packaging_item_ids)
+    total_packaging_g = 0.0
+    total_packaging_avoided = 0.0
+    for pkg in packaging_items:
+        pkg_name = pkg.get("name") or "Unknown Packaging"
+        pkg_grams = float(pkg.get("grams") or 0)
+        pkg_category = pkg.get("emission_factor_category") or "Mixed Paper (general)"
+        
+        total_packaging_g += pkg_grams
+        
+        # Get emission factor for packaging category
+        f = get_factor(str(pkg_category))
+        if not f:
+            # If no factor found, treat as zero impact but still include row
+            items_out.append(ItemResult(
+                component_name=pkg_name,
+                category=str(pkg_category),
+                share=1.0,
+                component_leftover_g=pkg_grams,
+                landfill_kgco2e=0.0,
+                compost_kgco2e=0.0,  # Using compost_kgco2e field to store recycle_kgco2e for packaging
+                avoided_kgco2e=0.0,
+                landfill_factor_kg_per_kg=0.0,
+                compost_factor_kg_per_kg=0.0,  # Storing recycle factor here for packaging
+            ))
+            continue
+        
+        # For packaging, use landfill_mtco2e_ton and recycle_mtco2e_ton
+        landfill_factor = mtco2e_per_ton_to_kg_per_kg(f["landfill_mtco2e_ton"]) if f.get("landfill_mtco2e_ton") is not None else 0.0
+        recycle_factor = mtco2e_per_ton_to_kg_per_kg(f["recycle_mtco2e_ton"]) if f.get("recycle_mtco2e_ton") is not None else 0.0
+        
+        kg = pkg_grams / 1000.0
+        landfill = kg * landfill_factor
+        recycle = kg * recycle_factor  # Stored in compost_kgco2e field
+        avoided = landfill - recycle
+        
+        items_out.append(ItemResult(
+            component_name=pkg_name,
+            category=str(pkg_category),
+            share=1.0,
+            component_leftover_g=pkg_grams,
+            landfill_kgco2e=round(landfill, 6),
+            compost_kgco2e=round(recycle, 6),  # Storing recycle emissions here for packaging
+            avoided_kgco2e=round(avoided, 6),
+            landfill_factor_kg_per_kg=round(landfill_factor, 6),
+            compost_factor_kg_per_kg=round(recycle_factor, 6),  # Storing recycle factor here
+        ))
+        
+        total_landfill += landfill
+        total_compost += recycle  # Add recycle emissions to compost total (representing recycling)
+        total_packaging_avoided += avoided
+
+    # Add packaging grams to total leftover grams
+    total_leftover_g += total_packaging_g
 
     totals = Totals(
         landfill_kgco2e=round(total_landfill, 6),
         compost_kgco2e=round(total_compost, 6),
-        avoided_kgco2e=round(total_landfill - total_compost, 6),
+        avoided_kgco2e=round(total_food_avoided + total_packaging_avoided, 6),
+        avoided_kgco2e_food=round(total_food_avoided, 6),
+        avoided_kgco2e_packaging=round(total_packaging_avoided, 6),
     )
 
     db_error = None
