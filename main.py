@@ -43,6 +43,7 @@ class Payload(BaseModel):
     userId: Optional[str] = None
     session_id: Optional[str] = None
     components: List[Component] = Field(..., min_items=1)
+    selected_items: Optional[List[str]] = Field(None, description="List of item names selected from items table (e.g., ['Garden Salad', 'Tea'])")
 
 
 class ItemResult(BaseModel):
@@ -63,7 +64,7 @@ class Totals(BaseModel):
 
 class ComputeResponse(BaseModel):
     session_id: Optional[str] = None
-    meal_name: Optional[str] = None
+    meal_name: Optional[List[str]] = None
     leftover_g: float
     items: List[ItemResult]
     totals: Totals
@@ -232,7 +233,7 @@ def meal_emissions(req: MealEmissionsRequest):
         insert_data = {
             "user_id": req.userId,
             "session_id": req.session_id,
-            "meal_name": meal_name,
+            "meal_name": [meal_name] if meal_name else None,
             "leftover_g": meal_leftover_g,
             "items": [i.model_dump() for i in items_out],
             "totals": totals.model_dump(),
@@ -254,7 +255,7 @@ def meal_emissions(req: MealEmissionsRequest):
 
     return ComputeResponse(
         session_id=req.session_id,
-        meal_name=meal_name,
+        meal_name=[meal_name] if meal_name else None,
         leftover_g=meal_leftover_g,
         items=items_out,
         totals=totals,
@@ -337,6 +338,7 @@ def calculate_emissions(data: Payload):
         insert_data = {
             "user_id": data.userId,
             "session_id": data.session_id,
+            "meal_name": data.selected_items if data.selected_items else None,
             "leftover_g": total_leftover_g,
             "items": [i.model_dump() for i in items_out],
             "totals": totals.model_dump(),
@@ -359,7 +361,7 @@ def calculate_emissions(data: Payload):
 
     return ComputeResponse(
         session_id=data.session_id,
-        meal_name=None,  # not applicable for this endpoint
+        meal_name=data.selected_items if data.selected_items else None,
         leftover_g=total_leftover_g,
         items=items_out,
         totals=totals,
