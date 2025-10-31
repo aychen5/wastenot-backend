@@ -1,9 +1,12 @@
 # app.py
 import os
+import re
 import logging
 from typing import List, Optional, Dict
 from fastapi import FastAPI, HTTPException, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from supabase import create_client, Client
 
@@ -32,6 +35,81 @@ app.add_middleware(
     expose_headers=["*"],
     max_age=3600,
 )
+
+# Helper function to check if origin is allowed
+def is_allowed_origin(origin: Optional[str]) -> bool:
+    """Check if origin is in allowed list."""
+    if not origin:
+        return False
+    allowed_origins = [
+        "https://a74f6327-764b-47f2-8e5a-0cf826e093a1.lovable.app",
+        "http://localhost:3000",
+        "http://localhost:5173",
+    ]
+    if origin in allowed_origins:
+        return True
+    # Check regex pattern
+    pattern = r"https://.*\.lovable\.app"
+    return bool(re.match(pattern, origin))
+
+# Exception handlers to ensure CORS headers are added to all errors
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Handle validation errors with CORS headers."""
+    origin = request.headers.get("origin")
+    cors_origin = origin if is_allowed_origin(origin) else None
+    headers = {}
+    if cors_origin:
+        headers = {
+            "Access-Control-Allow-Origin": cors_origin,
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD",
+            "Access-Control-Allow-Headers": "*",
+        }
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors(), "body": exc.body},
+        headers=headers
+    )
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Handle HTTP exceptions with CORS headers."""
+    origin = request.headers.get("origin")
+    cors_origin = origin if is_allowed_origin(origin) else None
+    headers = {}
+    if cors_origin:
+        headers = {
+            "Access-Control-Allow-Origin": cors_origin,
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD",
+            "Access-Control-Allow-Headers": "*",
+        }
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers=headers
+    )
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    """Handle all other exceptions with CORS headers."""
+    origin = request.headers.get("origin")
+    cors_origin = origin if is_allowed_origin(origin) else None
+    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    headers = {}
+    if cors_origin:
+        headers = {
+            "Access-Control-Allow-Origin": cors_origin,
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD",
+            "Access-Control-Allow-Headers": "*",
+        }
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"},
+        headers=headers
+    )
 
 
 # ----- Schemas -----
