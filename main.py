@@ -109,7 +109,7 @@ async def general_exception_handler(request: Request, exc: Exception):
         status_code=500,
         content={"detail": "Internal server error"},
         headers=headers
-    )
+)
 
 
 # ----- Schemas -----
@@ -131,10 +131,11 @@ class ItemResult(BaseModel):
     share: float
     component_leftover_g: float
     landfill_kgco2e: float
-    compost_kgco2e: float
+    compost_kgco2e: float  # For food: compost emissions; for packaging: recycle emissions
     avoided_kgco2e: float
     landfill_factor_kg_per_kg: float
-    compost_factor_kg_per_kg: float
+    compost_factor_kg_per_kg: float  # For food: compost factor; for packaging: recycle factor
+    recycle_factor_kg_per_kg: Optional[float] = None  # Only used for packaging items
 
 class Totals(BaseModel):
     landfill_kgco2e: float
@@ -142,6 +143,8 @@ class Totals(BaseModel):
     avoided_kgco2e: float
     avoided_kgco2e_food: float
     avoided_kgco2e_packaging: float
+    smartphone_charges_equiv: float  # Equivalent number of smartphone charges
+    gasoline_car_miles_equiv: float  # Equivalent miles driven by gasoline car
 
 class ComputeResponse(BaseModel):
     session_id: Optional[str] = None
@@ -193,6 +196,99 @@ def load_packaging_items(packaging_item_ids: Optional[List[str]]) -> List[Dict]:
     except Exception as e:
         logger.error(f"Error loading packaging items: {e}", exc_info=True)
         return []
+
+def calculate_energy_equivalencies(avoided_kgco2e: float) -> tuple[float, float]:
+    """
+    Calculate energy equivalencies for avoided CO2e emissions.
+    
+    For smartphone charges:
+    - Average smartphone charge: 12Wh = 0.012 kWh
+    - NY marginal factor (Zone J): 0.54 kg CO₂e/kWh
+    - CO2e per charge = 0.012 × 0.54 = 0.00648 kg CO₂e per charge
+    
+    For gasoline car miles:
+    - Average gasoline car: 393 g CO₂e per mile = 0.393 kg CO₂e per mile (EPA, includes CH₄/N₂O)
+    
+    Returns: (smartphone_charges, gasoline_car_miles)
+    """
+    # Smartphone calculation
+    CO2E_PER_SMARTPHONE_CHARGE_KG = 0.00648  # kg CO2e per charge
+    smartphone_charges = avoided_kgco2e / CO2E_PER_SMARTPHONE_CHARGE_KG if avoided_kgco2e > 0 else 0.0
+    
+    # Gasoline car calculation
+    CO2E_PER_GASOLINE_MILE_KG = 0.393  # kg CO2e per mile (393 g per mile from EPA, includes CH₄/N₂O)
+    gasoline_car_miles = avoided_kgco2e / CO2E_PER_GASOLINE_MILE_KG if avoided_kgco2e > 0 else 0.0
+    
+    return smartphone_charges, gasoline_car_miles
+
+def process_packaging_items(
+    packaging_items: List[Dict],
+    items_out: List[ItemResult],
+    total_landfill: float,
+    total_compost: float,
+    total_packaging_avoided: float
+) -> tuple[float, float, float, float]:
+    """
+    Process packaging items and calculate emissions.
+    Returns: (total_packaging_g, updated_total_landfill, updated_total_compost, updated_total_packaging_avoided)
+    """
+    total_packaging_g = 0.0
+    updated_total_landfill = total_landfill
+    updated_total_compost = total_compost
+    updated_total_packaging_avoided = total_packaging_avoided
+    
+    for pkg in packaging_items:
+        pkg_name = pkg.get("name") or "Unknown Packaging"
+        pkg_grams = float(pkg.get("grams") or 0)
+        pkg_category = pkg.get("emission_factor_category") or "Mixed Paper (general)"
+        
+        total_packaging_g += pkg_grams
+        
+        # Get emission factor for packaging category
+        f = get_factor(str(pkg_category))
+        if not f:
+            # If no factor found, treat as zero impact but still include row
+            items_out.append(ItemResult(
+                component_name=pkg_name,
+                category=str(pkg_category),
+                share=1.0,
+                component_leftover_g=pkg_grams,
+                landfill_kgco2e=0.0,
+                compost_kgco2e=0.0,  # For packaging: storing recycle emissions
+                avoided_kgco2e=0.0,
+                landfill_factor_kg_per_kg=0.0,
+                compost_factor_kg_per_kg=0.0,
+                recycle_factor_kg_per_kg=0.0,
+            ))
+            continue
+        
+        # For packaging, use landfill_mtco2e_ton and recycle_mtco2e_ton
+        landfill_factor = mtco2e_per_ton_to_kg_per_kg(f["landfill_mtco2e_ton"]) if f.get("landfill_mtco2e_ton") is not None else 0.0
+        recycle_factor = mtco2e_per_ton_to_kg_per_kg(f["recycle_mtco2e_ton"]) if f.get("recycle_mtco2e_ton") is not None else 0.0
+        
+        kg = pkg_grams / 1000.0
+        landfill = kg * landfill_factor
+        recycle = kg * recycle_factor  # Stored in compost_kgco2e field
+        avoided = landfill - recycle
+        
+        items_out.append(ItemResult(
+            component_name=pkg_name,
+            category=str(pkg_category),
+            share=1.0,
+            component_leftover_g=pkg_grams,
+            landfill_kgco2e=round(landfill, 6),
+            compost_kgco2e=round(recycle, 6),  # For packaging: storing recycle emissions
+            avoided_kgco2e=round(avoided, 6),
+            landfill_factor_kg_per_kg=round(landfill_factor, 6),
+            compost_factor_kg_per_kg=0.0,  # Not used for packaging
+            recycle_factor_kg_per_kg=round(recycle_factor, 6),
+        ))
+        
+        updated_total_landfill += landfill
+        updated_total_compost += recycle  # Add recycle emissions to compost total (representing recycling)
+        updated_total_packaging_avoided += avoided
+    
+    return total_packaging_g, updated_total_landfill, updated_total_compost, updated_total_packaging_avoided
 
 
 class MealEmissionsRequest(BaseModel):
@@ -287,6 +383,7 @@ def meal_emissions(req: MealEmissionsRequest):
                 avoided_kgco2e=0.0,
                 landfill_factor_kg_per_kg=0.0,
                 compost_factor_kg_per_kg=0.0,
+                recycle_factor_kg_per_kg=None,
             ))
             continue
 
@@ -312,6 +409,7 @@ def meal_emissions(req: MealEmissionsRequest):
             avoided_kgco2e=round(avoided, 6),
             landfill_factor_kg_per_kg=round(landfill_factor, 6),
             compost_factor_kg_per_kg=round(compost_factor, 6),
+            recycle_factor_kg_per_kg=None,
         ))
 
         total_landfill += landfill
@@ -320,66 +418,25 @@ def meal_emissions(req: MealEmissionsRequest):
 
     # Process packaging items
     packaging_items = load_packaging_items(req.packaging_item_ids)
-    total_packaging_g = 0.0
-    total_packaging_avoided = 0.0
-    for pkg in packaging_items:
-        pkg_name = pkg.get("name") or "Unknown Packaging"
-        pkg_grams = float(pkg.get("grams") or 0)
-        pkg_category = pkg.get("emission_factor_category") or "Mixed Paper (general)"
-        
-        total_packaging_g += pkg_grams
-        
-        # Get emission factor for packaging category
-        f = get_factor(str(pkg_category))
-        if not f:
-            # If no factor found, treat as zero impact but still include row
-            items_out.append(ItemResult(
-                component_name=pkg_name,
-                category=str(pkg_category),
-                share=1.0,
-                component_leftover_g=pkg_grams,
-                landfill_kgco2e=0.0,
-                compost_kgco2e=0.0,  # Using compost_kgco2e field to store recycle_kgco2e for packaging
-                avoided_kgco2e=0.0,
-                landfill_factor_kg_per_kg=0.0,
-                compost_factor_kg_per_kg=0.0,  # Storing recycle factor here for packaging
-            ))
-            continue
-        
-        # For packaging, use landfill_mtco2e_ton and recycle_mtco2e_ton
-        landfill_factor = mtco2e_per_ton_to_kg_per_kg(f["landfill_mtco2e_ton"]) if f.get("landfill_mtco2e_ton") is not None else 0.0
-        recycle_factor = mtco2e_per_ton_to_kg_per_kg(f["recycle_mtco2e_ton"]) if f.get("recycle_mtco2e_ton") is not None else 0.0
-        
-        kg = pkg_grams / 1000.0
-        landfill = kg * landfill_factor
-        recycle = kg * recycle_factor  # Stored in compost_kgco2e field
-        avoided = landfill - recycle
-        
-        items_out.append(ItemResult(
-            component_name=pkg_name,
-            category=str(pkg_category),
-            share=1.0,
-            component_leftover_g=pkg_grams,
-            landfill_kgco2e=round(landfill, 6),
-            compost_kgco2e=round(recycle, 6),  # Storing recycle emissions here for packaging
-            avoided_kgco2e=round(avoided, 6),
-            landfill_factor_kg_per_kg=round(landfill_factor, 6),
-            compost_factor_kg_per_kg=round(recycle_factor, 6),  # Storing recycle factor here
-        ))
-        
-        total_landfill += landfill
-        total_compost += recycle  # Add recycle emissions to compost total (representing recycling)
-        total_packaging_avoided += avoided
+    total_packaging_g, total_landfill, total_compost, total_packaging_avoided = process_packaging_items(
+        packaging_items, items_out, total_landfill, total_compost, 0.0
+    )
 
     # Add packaging grams to meal leftover grams
     meal_leftover_g_with_packaging = meal_leftover_g + total_packaging_g
 
+    # Calculate energy equivalencies
+    total_avoided = total_food_avoided + total_packaging_avoided
+    smartphone_charges, gasoline_car_miles = calculate_energy_equivalencies(total_avoided)
+
     totals = Totals(
         landfill_kgco2e=round(total_landfill, 6),
         compost_kgco2e=round(total_compost, 6),
-        avoided_kgco2e=round(total_food_avoided + total_packaging_avoided, 6),
+        avoided_kgco2e=round(total_avoided, 6),
         avoided_kgco2e_food=round(total_food_avoided, 6),
         avoided_kgco2e_packaging=round(total_packaging_avoided, 6),
+        smartphone_charges_equiv=round(smartphone_charges, 2),
+        gasoline_car_miles_equiv=round(gasoline_car_miles, 2),
     )
 
     db_error = None
@@ -453,6 +510,7 @@ def calculate_emissions(data: Payload):
                 avoided_kgco2e=0.0,
                 landfill_factor_kg_per_kg=0.0,
                 compost_factor_kg_per_kg=0.0,
+                recycle_factor_kg_per_kg=None,
             ))
             total_leftover_g += comp.leftover_g
             continue
@@ -475,6 +533,7 @@ def calculate_emissions(data: Payload):
             avoided_kgco2e=round(avoided, 6),
             landfill_factor_kg_per_kg=round(landfill_factor, 6),
             compost_factor_kg_per_kg=round(compost_factor, 6),
+            recycle_factor_kg_per_kg=None,
         ))
         
         total_leftover_g += comp.leftover_g
@@ -485,66 +544,25 @@ def calculate_emissions(data: Payload):
 
     # Process packaging items
     packaging_items = load_packaging_items(data.packaging_item_ids)
-    total_packaging_g = 0.0
-    total_packaging_avoided = 0.0
-    for pkg in packaging_items:
-        pkg_name = pkg.get("name") or "Unknown Packaging"
-        pkg_grams = float(pkg.get("grams") or 0)
-        pkg_category = pkg.get("emission_factor_category") or "Mixed Paper (general)"
-        
-        total_packaging_g += pkg_grams
-        
-        # Get emission factor for packaging category
-        f = get_factor(str(pkg_category))
-        if not f:
-            # If no factor found, treat as zero impact but still include row
-            items_out.append(ItemResult(
-                component_name=pkg_name,
-                category=str(pkg_category),
-                share=1.0,
-                component_leftover_g=pkg_grams,
-                landfill_kgco2e=0.0,
-                compost_kgco2e=0.0,  # Using compost_kgco2e field to store recycle_kgco2e for packaging
-                avoided_kgco2e=0.0,
-                landfill_factor_kg_per_kg=0.0,
-                compost_factor_kg_per_kg=0.0,  # Storing recycle factor here for packaging
-            ))
-            continue
-        
-        # For packaging, use landfill_mtco2e_ton and recycle_mtco2e_ton
-        landfill_factor = mtco2e_per_ton_to_kg_per_kg(f["landfill_mtco2e_ton"]) if f.get("landfill_mtco2e_ton") is not None else 0.0
-        recycle_factor = mtco2e_per_ton_to_kg_per_kg(f["recycle_mtco2e_ton"]) if f.get("recycle_mtco2e_ton") is not None else 0.0
-        
-        kg = pkg_grams / 1000.0
-        landfill = kg * landfill_factor
-        recycle = kg * recycle_factor  # Stored in compost_kgco2e field
-        avoided = landfill - recycle
-        
-        items_out.append(ItemResult(
-            component_name=pkg_name,
-            category=str(pkg_category),
-            share=1.0,
-            component_leftover_g=pkg_grams,
-            landfill_kgco2e=round(landfill, 6),
-            compost_kgco2e=round(recycle, 6),  # Storing recycle emissions here for packaging
-            avoided_kgco2e=round(avoided, 6),
-            landfill_factor_kg_per_kg=round(landfill_factor, 6),
-            compost_factor_kg_per_kg=round(recycle_factor, 6),  # Storing recycle factor here
-        ))
-        
-        total_landfill += landfill
-        total_compost += recycle  # Add recycle emissions to compost total (representing recycling)
-        total_packaging_avoided += avoided
+    total_packaging_g, total_landfill, total_compost, total_packaging_avoided = process_packaging_items(
+        packaging_items, items_out, total_landfill, total_compost, 0.0
+    )
 
     # Add packaging grams to total leftover grams
     total_leftover_g += total_packaging_g
 
+    # Calculate energy equivalencies
+    total_avoided = total_food_avoided + total_packaging_avoided
+    smartphone_charges, gasoline_car_miles = calculate_energy_equivalencies(total_avoided)
+
     totals = Totals(
         landfill_kgco2e=round(total_landfill, 6),
         compost_kgco2e=round(total_compost, 6),
-        avoided_kgco2e=round(total_food_avoided + total_packaging_avoided, 6),
+        avoided_kgco2e=round(total_avoided, 6),
         avoided_kgco2e_food=round(total_food_avoided, 6),
         avoided_kgco2e_packaging=round(total_packaging_avoided, 6),
+        smartphone_charges_equiv=round(smartphone_charges, 2),
+        gasoline_car_miles_equiv=round(gasoline_car_miles, 2),
     )
 
     db_error = None
