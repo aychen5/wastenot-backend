@@ -396,135 +396,150 @@ def calculate_diversion_rates(df: pd.DataFrame, district_type: str) -> List[Dist
     """
     Calculate diversion rates from NYC tonnage data by district type.
     
-    Diversion Rate = (Recycled Tonnage / Total Tonnage) * 100
+    Diversion Rate = (Recycled tons + Composted tons) / Total waste tons × 100
+    Where:
+    - Recycled = MGPTONSCOLLECTED (metal/glass/plastic) + PAPERTONSCOLLECTED (paper)
+    - Composted = RESORGANICSTONS (organics/compost)
+    - Total = Recycled + Composted + REFUSETONSCOLLECTED (trash)
     """
     if df.empty:
         return []
-    
-    # Normalize column names (SOCRATA API may return different casing)
-    df.columns = df.columns.str.lower().str.replace(' ', '_')
     
     # Map district type to column names
     district_column_map = {
         "community": ["COMMUNITYDISTRICT", "cd", "community_district"],
         "borough": ["BOROUGH", "BOROUGH_ID"],
-        "sanitation": ["sanitationdistrict", "sanitation_district", "district"]
     }
     
-    # Find the appropriate district column
+    # Find the appropriate district column (case-insensitive search)
     district_col = None
     possible_cols = district_column_map.get(district_type.lower(), [])
+    df_columns_upper = [c.upper() for c in df.columns]
+    
     for col in possible_cols:
+        # Try exact match first
         if col in df.columns:
             district_col = col
             break
+        # Try case-insensitive match
+        if col.upper() in df_columns_upper:
+            district_col = df.columns[df_columns_upper.index(col.upper())]
+            break
     
     if district_col is None:
-        # Try to find any district-related column
-        district_cols = [c for c in df.columns if 'district' in c or 'cd' in c]
+        # Try to find any district-related column (case-insensitive)
+        district_cols = [c for c in df.columns if 'COMMUNITYDISTRICT' in c.upper() or 'CD' in c.upper() or 'BOROUGH' in c.upper()]
         if district_cols:
             district_col = district_cols[0]
         else:
-            logger.warning(f"No district column found for type {district_type}, using first available")
-            district_col = df.columns[0] if len(df.columns) > 0 else None
-            if district_col is None:
-                return []
+            logger.warning(f"No district column found for type {district_type}")
+            return []
     
-    # Find tonnage columns
-    # Common column names: tonnage_of_recyclables, tonnage_of_refuse, total_tonnage, etc.
-    recycle_cols = [c for c in df.columns if 'recycl' in c and 'tonnage' in c]
-    refuse_cols = [c for c in df.columns if ('refuse' in c or 'garbage' in c) and 'tonnage' in c]
-    total_cols = [c for c in df.columns if 'total' in c and 'tonnage' in c]
+    # Find columns (case-insensitive) - use specific column names from NYC dataset
+    df_columns_dict = {c.upper(): c for c in df.columns}
+    mgp_col = df_columns_dict.get("MGPTONSCOLLECTED", None)
+    paper_col = df_columns_dict.get("PAPERTONSCOLLECTED", None)
+    organic_col = df_columns_dict.get("RESORGANICSTONS", None)
+    refuse_col = df_columns_dict.get("REFUSETONSCOLLECTED", None)
     
-    recycle_col = recycle_cols[0] if recycle_cols else None
-    refuse_col = refuse_cols[0] if refuse_cols else None
-    
-    # If no specific columns found, try alternative naming
-    if not recycle_col:
-        recycle_col = [c for c in df.columns if 'recycl' in c.lower()][0] if any('recycl' in c.lower() for c in df.columns) else None
-    if not refuse_col:
-        refuse_col = [c for c in df.columns if ('refuse' in c.lower() or 'garbage' in c.lower())][0] if any('refuse' in c.lower() or 'garbage' in c.lower() for c in df.columns) else None
+    if not mgp_col or not paper_col or not organic_col or not refuse_col:
+        missing = [col for col, val in [
+            ("MGPTONSCOLLECTED", mgp_col),
+            ("PAPERTONSCOLLECTED", paper_col),
+            ("RESORGANICSTONS", organic_col),
+            ("REFUSETONSCOLLECTED", refuse_col)
+        ] if not val]
+        logger.error(f"Missing required columns: {missing}. Available columns: {list(df.columns)}")
+        return []
     
     # Convert tonnage columns to numeric
-    for col in [recycle_col, refuse_col, district_col]:
-        if col and col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
+    for col in [mgp_col, paper_col, organic_col, refuse_col, district_col]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
     
     # Group by district and calculate totals
     district_data = []
     
-    if district_col and recycle_col:
-        # Group by district
-        grouped = df.groupby(district_col)
+    grouped = df.groupby(district_col)
+    
+    for district_id, group_df in grouped:
+        district_id_str = str(district_id).strip()
         
-        for district_id, group_df in grouped:
-            district_id_str = str(district_id).strip()
-            
-            # Calculate total recycled tonnage
-            recycled = group_df[recycle_col].sum() if recycle_col else 0
-            
-            # Calculate total refuse tonnage
-            refuse = group_df[refuse_col].sum() if refuse_col else 0
-            
-            # Total tonnage = recycled + refuse
-            total_tonnage = recycled + refuse
-            
-            # Calculate diversion rate
-            if total_tonnage > 0:
-                diversion_rate = (recycled / total_tonnage) * 100
-            else:
-                diversion_rate = 0.0
-            
-            # Get most recent month
-            month_cols = [c for c in df.columns if 'month' in c.lower()]
-            if month_cols:
-                try:
-                    group_df_sorted = group_df.sort_values(month_cols[0], ascending=False)
-                    recent_month = group_df_sorted.iloc[0][month_cols[0]] if len(group_df_sorted) > 0 else None
-                except:
-                    recent_month = None
-            else:
+        # Calculate tonnages
+        mgp = group_df[mgp_col].sum()
+        paper = group_df[paper_col].sum()
+        organic = group_df[organic_col].sum()
+        refuse = group_df[refuse_col].sum()
+        
+        # Total diverted = recycled (mgp + paper) + composted (organic)
+        diverted_tonnage = mgp + paper + organic
+        
+        # Total waste = diverted + refuse
+        total_tonnage = diverted_tonnage + refuse
+        
+        # Calculate diversion rate: (Recycled + Composted) / Total × 100
+        if total_tonnage > 0:
+            diversion_rate = (diverted_tonnage / total_tonnage) * 100
+        else:
+            diversion_rate = 0.0
+        
+        # Get most recent month
+        month_cols = [c for c in df.columns if 'MONTH' in c.upper() or 'MONTH' in c]
+        if month_cols:
+            try:
+                group_df_sorted = group_df.sort_values(month_cols[0], ascending=False)
+                recent_month = group_df_sorted.iloc[0][month_cols[0]] if len(group_df_sorted) > 0 else None
+            except:
                 recent_month = None
-            
-            # Calculate projections using simple linear trend
-            projections = calculate_projections(group_df, recycle_col, refuse_col)
-            
-            district_data.append(DistrictDiversionData(
-                district_id=district_id_str,
-                district_name=f"{district_type.capitalize()} District {district_id_str}",
-                diversion_rate=round(diversion_rate, 2),
-                total_tonnage=round(total_tonnage, 2),
-                recycled_tonnage=round(recycled, 2),
-                month_year=str(recent_month) if recent_month else None,
-                projection_6mo=round(projections['6mo'], 2) if projections else None,
-                projection_12mo=round(projections['12mo'], 2) if projections else None,
-                latitude=None,  # Could be enriched with district coordinates
-                longitude=None,
-            ))
+        else:
+            recent_month = None
+        
+        # Calculate projections using simple linear trend
+        projections = calculate_projections(group_df, mgp_col, paper_col, organic_col, refuse_col)
+        
+        district_data.append(DistrictDiversionData(
+            district_id=district_id_str,
+            district_name=f"{district_type.capitalize()} District {district_id_str}",
+            diversion_rate=round(diversion_rate, 2),
+            total_tonnage=round(total_tonnage, 2),
+            recycled_tonnage=round(diverted_tonnage, 2),  # Total diverted (recycled + composted)
+            month_year=str(recent_month) if recent_month else None,
+            projection_6mo=round(projections['6mo'], 2) if projections else None,
+            projection_12mo=round(projections['12mo'], 2) if projections else None,
+            latitude=None,  # Could be enriched with district coordinates
+            longitude=None,
+        ))
     
     # Sort by district_id
     district_data.sort(key=lambda x: x.district_id)
     
     return district_data
 
-def calculate_projections(group_df: pd.DataFrame, recycle_col: Optional[str], refuse_col: Optional[str]) -> Optional[Dict[str, float]]:
+def calculate_projections(group_df: pd.DataFrame, mgp_col: str, paper_col: str, organic_col: str, refuse_col: str) -> Optional[Dict[str, float]]:
     """
     Calculate 6-month and 12-month projections using linear trend analysis.
     Returns projected diversion rates.
+    
+    Diversion Rate = (Recycled + Composted) / Total × 100
     """
-    if recycle_col not in group_df.columns or refuse_col not in group_df.columns:
+    if mgp_col not in group_df.columns or paper_col not in group_df.columns or \
+       organic_col not in group_df.columns or refuse_col not in group_df.columns:
         return None
     
     try:
         # Sort by month if available
-        month_cols = [c for c in group_df.columns if 'month' in c.lower()]
+        month_cols = [c for c in group_df.columns if 'MONTH' in c.upper() or 'MONTH' in c]
         if month_cols:
             group_df = group_df.sort_values(month_cols[0])
         
         # Calculate monthly diversion rates
         group_df = group_df.copy()
-        group_df['total'] = group_df[recycle_col] + group_df[refuse_col]
-        group_df['diversion_rate'] = (group_df[recycle_col] / group_df['total'] * 100).replace([np.inf, -np.inf], 0)
+        # Diverted = MGP + Paper + Organic (recycled + composted)
+        group_df['diverted'] = group_df[mgp_col] + group_df[paper_col] + group_df[organic_col]
+        # Total = Diverted + Refuse
+        group_df['total'] = group_df['diverted'] + group_df[refuse_col]
+        # Diversion rate = (Diverted / Total) × 100
+        group_df['diversion_rate'] = (group_df['diverted'] / group_df['total'] * 100).replace([np.inf, -np.inf], 0)
         
         # Remove NaN values
         group_df = group_df.dropna(subset=['diversion_rate'])
@@ -552,11 +567,10 @@ def calculate_projections(group_df: pd.DataFrame, recycle_col: Optional[str], re
     except Exception as e:
         logger.warning(f"Error calculating projections: {e}")
         # Return current average as fallback
-        if recycle_col in group_df.columns and refuse_col in group_df.columns:
-            totals = group_df[recycle_col] + group_df[refuse_col]
-            recycled = group_df[recycle_col].sum()
-            total = totals.sum()
-            current_rate = (recycled / total * 100) if total > 0 else 0
+        if all(col in group_df.columns for col in [mgp_col, paper_col, organic_col, refuse_col]):
+            diverted = group_df[mgp_col].sum() + group_df[paper_col].sum() + group_df[organic_col].sum()
+            total = diverted + group_df[refuse_col].sum()
+            current_rate = (diverted / total * 100) if total > 0 else 0
             return {'6mo': current_rate, '12mo': current_rate}
         return None
 
@@ -885,24 +899,28 @@ async def neighborhood_diversion_rates_options(request: Request):
 async def neighborhood_diversion_rates(
     district_type: str = Query(
         default="community",
-        description="Type of district: community, borough, or sanitation",
-        regex="^(community|borough|sanitation)$"
+        description="Type of district: community or borough",
+        regex="^(community|borough)$"
     )
 ):
     """
     Calculate diversion rates by district type using NYC's monthly tonnage data.
     
-    Diversion rate = (Recycled Tonnage / Total Tonnage) * 100
+    Diversion rate = (Recycled tons + Composted tons) / Total waste tons × 100
+    Where:
+    - Recycled = MGPTONSCOLLECTED (metal/glass/plastic) + PAPERTONSCOLLECTED (paper)
+    - Composted = RESORGANICSTONS (organics/compost)
+    - Total = Recycled + Composted + REFUSETONSCOLLECTED (trash)
     
     Returns diversion rates and projections for each district, suitable for Mapbox visualization.
     """
     try:
         # Validate district_type
         district_type_lower = district_type.lower()
-        if district_type_lower not in ["community", "borough", "sanitation"]:
+        if district_type_lower not in ["community", "borough"]:
             raise HTTPException(
                 status_code=400,
-                detail=f"Invalid district_type. Must be one of: community, borough, sanitation"
+                detail=f"Invalid district_type. Must be one of: community, borough"
             )
         
         # Fetch NYC tonnage data
