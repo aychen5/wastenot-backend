@@ -2,13 +2,17 @@
 import os
 import re
 import logging
-from typing import List, Optional, Dict
-from fastapi import FastAPI, HTTPException, Response, Request
+from typing import List, Optional, Dict, Literal
+from datetime import datetime, timedelta
+from fastapi import FastAPI, HTTPException, Response, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from supabase import create_client, Client
+import httpx
+import pandas as pd
+import numpy as np
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -155,6 +159,26 @@ class ComputeResponse(BaseModel):
     db_row_id: Optional[str] = None
     db_error: Optional[str] = None
 
+# ----- Neighborhood Diversion Rates Schemas -----
+class DistrictDiversionData(BaseModel):
+    district_id: str
+    district_name: str
+    diversion_rate: float  # percentage (0-100)
+    total_tonnage: float  # total waste collected in tons
+    recycled_tonnage: float  # recycled waste in tons
+    month_year: Optional[str] = None  # most recent month data
+    projection_6mo: Optional[float] = None  # projected diversion rate 6 months out
+    projection_12mo: Optional[float] = None  # projected diversion rate 12 months out
+    latitude: Optional[float] = None  # for Mapbox visualization
+    longitude: Optional[float] = None  # for Mapbox visualization
+
+class NeighborhoodDiversionResponse(BaseModel):
+    district_type: str
+    districts: List[DistrictDiversionData]
+    data_source: str
+    last_updated: Optional[str] = None
+    metadata: Optional[Dict] = None
+
 # ----- Helpers -----
 def mtco2e_per_ton_to_kg_per_kg(mtco2e_per_short_ton: float) -> float:
     # WARM factors are MTCO2e per short ton; convert to kg CO2e per kg
@@ -289,6 +313,252 @@ def process_packaging_items(
         updated_total_packaging_avoided += avoided
     
     return total_packaging_g, updated_total_landfill, updated_total_compost, updated_total_packaging_avoided
+
+# ----- NYC OpenData Helpers -----
+# NYC DSNY Monthly Tonnage Data - SOCRATA API endpoint
+NYC_DSNY_TONNAGE_DATASET_ID = "ebb7-mvp5"  # DSNY Monthly Tonnage Data dataset ID
+NYC_SOCRATA_BASE_URL = "https://data.cityofnewyork.us/resource"
+# Optional SOCRATA API token - checks multiple environment variable names
+# Priority: SOCRATA_APP_TOKEN > SOCRATA_SECRET_TOKEN > NYC_SOCRATA_TOKEN
+# Get token from: https://data.cityofnewyork.us/profile/app_tokens
+NYC_SOCRATA_TOKEN = (
+    os.environ.get("SOCRATA_APP_TOKEN") or 
+    os.environ.get("SOCRATA_SECRET_TOKEN")
+)
+
+_data_cache: Optional[pd.DataFrame] = None
+_cache_timestamp: Optional[datetime] = None
+CACHE_DURATION_HOURS = 1  # Cache data for 1 hour
+
+async def fetch_nyc_tonnage_data() -> pd.DataFrame:
+    """
+    Fetch NYC DSNY monthly tonnage data from SOCRATA API.
+    Returns a pandas DataFrame with the data.
+    
+    Uses NYC_SOCRATA_TOKEN if available for higher rate limits (1000 req/hr vs lower without token).
+    """
+    global _data_cache, _cache_timestamp
+    
+    # Check cache
+    if _data_cache is not None and _cache_timestamp is not None:
+        if datetime.now() - _cache_timestamp < timedelta(hours=CACHE_DURATION_HOURS):
+            logger.info("Returning cached NYC tonnage data")
+            return _data_cache
+    
+    try:
+        # Build SOCRATA API URL with query parameters
+        url = f"{NYC_SOCRATA_BASE_URL}/{NYC_DSNY_TONNAGE_DATASET_ID}.json"
+        
+        # Request limit - get last 2 years of data
+        params = {
+            "$limit": 50000,  # Adjust based on data volume
+            "$order": "month DESC",  # Get most recent first
+        }
+        
+        # Add token if available (for higher rate limits: 1000 req/hr vs lower without token)
+        headers = {}
+        if NYC_SOCRATA_TOKEN:
+            headers["X-App-Token"] = NYC_SOCRATA_TOKEN
+            logger.info("Using SOCRATA API token for enhanced rate limits")
+        else:
+            logger.info("No SOCRATA token found - using public API (lower rate limits)")
+        
+        logger.info(f"Fetching NYC tonnage data from {url}")
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url, params=params, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+        
+        if not data:
+            logger.warning("No data returned from NYC OpenData API")
+            return pd.DataFrame()
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(data)
+        
+        # Cache the data
+        _data_cache = df
+        _cache_timestamp = datetime.now()
+        logger.info(f"Fetched {len(df)} records from NYC OpenData")
+        
+        return df
+        
+    except Exception as e:
+        logger.error(f"Error fetching NYC tonnage data: {e}", exc_info=True)
+        # Return cached data if available, otherwise raise
+        if _data_cache is not None:
+            logger.warning("Using stale cached data due to fetch error")
+            return _data_cache
+        raise HTTPException(status_code=503, detail=f"Unable to fetch NYC data: {str(e)}")
+
+def calculate_diversion_rates(df: pd.DataFrame, district_type: str) -> List[DistrictDiversionData]:
+    """
+    Calculate diversion rates from NYC tonnage data by district type.
+    
+    Diversion Rate = (Recycled Tonnage / Total Tonnage) * 100
+    """
+    if df.empty:
+        return []
+    
+    # Normalize column names (SOCRATA API may return different casing)
+    df.columns = df.columns.str.lower().str.replace(' ', '_')
+    
+    # Map district type to column names
+    district_column_map = {
+        "community": ["COMMUNITYDISTRICT", "cd", "community_district"],
+        "borough": ["BOROUGH", "BOROUGH_ID"],
+        "sanitation": ["sanitationdistrict", "sanitation_district", "district"]
+    }
+    
+    # Find the appropriate district column
+    district_col = None
+    possible_cols = district_column_map.get(district_type.lower(), [])
+    for col in possible_cols:
+        if col in df.columns:
+            district_col = col
+            break
+    
+    if district_col is None:
+        # Try to find any district-related column
+        district_cols = [c for c in df.columns if 'district' in c or 'cd' in c]
+        if district_cols:
+            district_col = district_cols[0]
+        else:
+            logger.warning(f"No district column found for type {district_type}, using first available")
+            district_col = df.columns[0] if len(df.columns) > 0 else None
+            if district_col is None:
+                return []
+    
+    # Find tonnage columns
+    # Common column names: tonnage_of_recyclables, tonnage_of_refuse, total_tonnage, etc.
+    recycle_cols = [c for c in df.columns if 'recycl' in c and 'tonnage' in c]
+    refuse_cols = [c for c in df.columns if ('refuse' in c or 'garbage' in c) and 'tonnage' in c]
+    total_cols = [c for c in df.columns if 'total' in c and 'tonnage' in c]
+    
+    recycle_col = recycle_cols[0] if recycle_cols else None
+    refuse_col = refuse_cols[0] if refuse_cols else None
+    
+    # If no specific columns found, try alternative naming
+    if not recycle_col:
+        recycle_col = [c for c in df.columns if 'recycl' in c.lower()][0] if any('recycl' in c.lower() for c in df.columns) else None
+    if not refuse_col:
+        refuse_col = [c for c in df.columns if ('refuse' in c.lower() or 'garbage' in c.lower())][0] if any('refuse' in c.lower() or 'garbage' in c.lower() for c in df.columns) else None
+    
+    # Convert tonnage columns to numeric
+    for col in [recycle_col, refuse_col, district_col]:
+        if col and col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    
+    # Group by district and calculate totals
+    district_data = []
+    
+    if district_col and recycle_col:
+        # Group by district
+        grouped = df.groupby(district_col)
+        
+        for district_id, group_df in grouped:
+            district_id_str = str(district_id).strip()
+            
+            # Calculate total recycled tonnage
+            recycled = group_df[recycle_col].sum() if recycle_col else 0
+            
+            # Calculate total refuse tonnage
+            refuse = group_df[refuse_col].sum() if refuse_col else 0
+            
+            # Total tonnage = recycled + refuse
+            total_tonnage = recycled + refuse
+            
+            # Calculate diversion rate
+            if total_tonnage > 0:
+                diversion_rate = (recycled / total_tonnage) * 100
+            else:
+                diversion_rate = 0.0
+            
+            # Get most recent month
+            month_cols = [c for c in df.columns if 'month' in c.lower()]
+            if month_cols:
+                try:
+                    group_df_sorted = group_df.sort_values(month_cols[0], ascending=False)
+                    recent_month = group_df_sorted.iloc[0][month_cols[0]] if len(group_df_sorted) > 0 else None
+                except:
+                    recent_month = None
+            else:
+                recent_month = None
+            
+            # Calculate projections using simple linear trend
+            projections = calculate_projections(group_df, recycle_col, refuse_col)
+            
+            district_data.append(DistrictDiversionData(
+                district_id=district_id_str,
+                district_name=f"{district_type.capitalize()} District {district_id_str}",
+                diversion_rate=round(diversion_rate, 2),
+                total_tonnage=round(total_tonnage, 2),
+                recycled_tonnage=round(recycled, 2),
+                month_year=str(recent_month) if recent_month else None,
+                projection_6mo=round(projections['6mo'], 2) if projections else None,
+                projection_12mo=round(projections['12mo'], 2) if projections else None,
+                latitude=None,  # Could be enriched with district coordinates
+                longitude=None,
+            ))
+    
+    # Sort by district_id
+    district_data.sort(key=lambda x: x.district_id)
+    
+    return district_data
+
+def calculate_projections(group_df: pd.DataFrame, recycle_col: Optional[str], refuse_col: Optional[str]) -> Optional[Dict[str, float]]:
+    """
+    Calculate 6-month and 12-month projections using linear trend analysis.
+    Returns projected diversion rates.
+    """
+    if recycle_col not in group_df.columns or refuse_col not in group_df.columns:
+        return None
+    
+    try:
+        # Sort by month if available
+        month_cols = [c for c in group_df.columns if 'month' in c.lower()]
+        if month_cols:
+            group_df = group_df.sort_values(month_cols[0])
+        
+        # Calculate monthly diversion rates
+        group_df = group_df.copy()
+        group_df['total'] = group_df[recycle_col] + group_df[refuse_col]
+        group_df['diversion_rate'] = (group_df[recycle_col] / group_df['total'] * 100).replace([np.inf, -np.inf], 0)
+        
+        # Remove NaN values
+        group_df = group_df.dropna(subset=['diversion_rate'])
+        
+        if len(group_df) < 3:
+            # Not enough data for projection
+            current_rate = group_df['diversion_rate'].mean() if len(group_df) > 0 else 0
+            return {'6mo': current_rate, '12mo': current_rate}
+        
+        # Simple linear trend: use average of last 3 months
+        recent_data = group_df.tail(3)['diversion_rate']
+        avg_rate = recent_data.mean()
+        trend = (recent_data.iloc[-1] - recent_data.iloc[0]) / len(recent_data) if len(recent_data) > 1 else 0
+        
+        # Project forward (conservative - assume trend continues but diminishes)
+        projection_6mo = avg_rate + (trend * 3)  # 3 months average for 6mo
+        projection_12mo = avg_rate + (trend * 6)  # 6 months average for 12mo
+        
+        # Cap at reasonable values (0-100%)
+        projection_6mo = max(0, min(100, projection_6mo))
+        projection_12mo = max(0, min(100, projection_12mo))
+        
+        return {'6mo': projection_6mo, '12mo': projection_12mo}
+        
+    except Exception as e:
+        logger.warning(f"Error calculating projections: {e}")
+        # Return current average as fallback
+        if recycle_col in group_df.columns and refuse_col in group_df.columns:
+            totals = group_df[recycle_col] + group_df[refuse_col]
+            recycled = group_df[recycle_col].sum()
+            total = totals.sum()
+            current_rate = (recycled / total * 100) if total > 0 else 0
+            return {'6mo': current_rate, '12mo': current_rate}
+        return None
 
 
 class MealEmissionsRequest(BaseModel):
@@ -601,6 +871,90 @@ def calculate_emissions(data: Payload):
         db_row_id=db_row_id,
         db_error=db_error
     )
+
+# ----- Neighborhood Diversion Rates Endpoint -----
+@app.options("/neighborhood-diversion-rates")
+async def neighborhood_diversion_rates_options(request: Request):
+    """Handle CORS preflight for neighborhood-diversion-rates endpoint."""
+    origin = request.headers.get("origin")
+    logger.info(f"OPTIONS request received for /neighborhood-diversion-rates from {origin}")
+    response = Response(status_code=204)
+    return response
+
+@app.get("/neighborhood-diversion-rates", response_model=NeighborhoodDiversionResponse)
+async def neighborhood_diversion_rates(
+    district_type: str = Query(
+        default="community",
+        description="Type of district: community, borough, or sanitation",
+        regex="^(community|borough|sanitation)$"
+    )
+):
+    """
+    Calculate diversion rates by district type using NYC's monthly tonnage data.
+    
+    Diversion rate = (Recycled Tonnage / Total Tonnage) * 100
+    
+    Returns diversion rates and projections for each district, suitable for Mapbox visualization.
+    """
+    try:
+        # Validate district_type
+        district_type_lower = district_type.lower()
+        if district_type_lower not in ["community", "borough", "sanitation"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid district_type. Must be one of: community, borough, sanitation"
+            )
+        
+        # Fetch NYC tonnage data
+        logger.info(f"Fetching diversion rates for district_type: {district_type_lower}")
+        df = await fetch_nyc_tonnage_data()
+        
+        if df.empty:
+            logger.warning("No data available from NYC OpenData")
+            return NeighborhoodDiversionResponse(
+                district_type=district_type_lower,
+                districts=[],
+                data_source="NYC OpenData (DSNY Monthly Tonnage Data)",
+                last_updated=None,
+                metadata={"error": "No data available"}
+            )
+        
+        # Calculate diversion rates
+        districts = calculate_diversion_rates(df, district_type_lower)
+        
+        if not districts:
+            logger.warning(f"No districts found for district_type: {district_type_lower}")
+            return NeighborhoodDiversionResponse(
+                district_type=district_type_lower,
+                districts=[],
+                data_source="NYC OpenData (DSNY Monthly Tonnage Data)",
+                last_updated=_cache_timestamp.isoformat() if _cache_timestamp else None,
+                metadata={"warning": "No districts found", "columns": list(df.columns)}
+            )
+        
+        # Get cache timestamp
+        last_updated = _cache_timestamp.isoformat() if _cache_timestamp else datetime.now().isoformat()
+        
+        return NeighborhoodDiversionResponse(
+            district_type=district_type_lower,
+            districts=districts,
+            data_source="NYC OpenData (DSNY Monthly Tonnage Data)",
+            last_updated=last_updated,
+            metadata={
+                "total_districts": len(districts),
+                "dataset_id": NYC_DSNY_TONNAGE_DATASET_ID,
+                "api_url": f"{NYC_SOCRATA_BASE_URL}/{NYC_DSNY_TONNAGE_DATASET_ID}.json"
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error calculating neighborhood diversion rates: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal server error: {str(e)}"
+        )
 
 # ----- Health & root -----
 @app.get("/health")
