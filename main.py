@@ -165,7 +165,9 @@ class DistrictDiversionData(BaseModel):
     district_name: str
     diversion_rate: float  # percentage (0-100)
     total_tonnage: float  # total waste collected in tons
-    recycled_tonnage: float  # recycled waste in tons
+    recycled_tonnage: float  # recycled waste (MGP + Paper) in tons
+    composted_tonnage: float  # composted/organic waste in tons
+    compost_rate: float  # compost rate as percentage (0-100)
     month_year: Optional[str] = None  # most recent month data
     projection_6mo: Optional[float] = None  # projected diversion rate 6 months out
     projection_12mo: Optional[float] = None  # projected diversion rate 12 months out
@@ -452,18 +454,68 @@ def calculate_diversion_rates(df: pd.DataFrame, district_type: str) -> List[Dist
         logger.error(f"Missing required columns: {missing}. Available columns: {list(df.columns)}")
         return []
     
-    # Convert tonnage columns to numeric
-    for col in [mgp_col, paper_col, organic_col, refuse_col, district_col]:
+    # Borough name to ID mapping (NYC standard)
+    borough_name_to_id = {
+        'Manhattan': '1',
+        'Bronx': '2',
+        'Brooklyn': '3',
+        'Queens': '4',
+        'Staten Island': '5',
+    }
+    
+    # For borough type, normalize BOROUGH column values to IDs (1-5)
+    if district_type.lower() == 'borough' and district_col and district_col in df.columns:
+        # Check what values are in the BOROUGH column before converting to numeric
+        unique_boroughs = df[district_col].dropna().unique()
+        logger.info(f"Found unique borough values in {district_col}: {unique_boroughs[:10]}")  # Log first 10
+        
+        # Check if values are names (strings) or IDs (numbers)
+        sample_val = unique_boroughs[0] if len(unique_boroughs) > 0 else None
+        if sample_val is not None:
+            # If the value is a string (borough name), convert to ID
+            if isinstance(sample_val, str) and not sample_val.replace('.', '').replace('-', '').isdigit():
+                # Values are borough names - create a mapping column
+                logger.info(f"BOROUGH column contains names, converting to IDs")
+                df['_borough_id'] = df[district_col].apply(
+                    lambda x: borough_name_to_id.get(str(x).strip(), None) 
+                    or next((bid for name, bid in borough_name_to_id.items() 
+                            if name.lower() == str(x).strip().lower()), None)
+                    or str(x).strip()
+                )
+                # Replace district_col with the ID column
+                district_col = '_borough_id'
+            else:
+                # Values might be numeric IDs or need normalization
+                logger.info(f"BOROUGH column contains numeric values")
+                # Try to convert to numeric and check if they're 1-5
+                df[district_col] = pd.to_numeric(df[district_col], errors='coerce')
+                unique_numeric = df[district_col].dropna().unique()
+                # Check if all values are 0 or invalid
+                if len(unique_numeric) > 0 and all(v == 0 or pd.isna(v) for v in unique_numeric):
+                    logger.warning(f"All borough IDs are 0 or invalid - values: {unique_numeric}")
+                else:
+                    # Convert to string for consistency
+                    df[district_col] = df[district_col].apply(lambda x: str(int(x)) if pd.notna(x) and x > 0 else '0')
+        else:
+            logger.warning(f"No borough values found in {district_col}")
+    
+    # Convert tonnage columns to numeric (but not district_col if we're using names)
+    for col in [mgp_col, paper_col, organic_col, refuse_col]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    
+    # If district_col is numeric, convert it
+    if district_col in df.columns and district_col != '_borough_id':
+        df[district_col] = pd.to_numeric(df[district_col], errors='coerce').fillna(0)
     
     # Group by district and calculate totals
     district_data = []
     
     grouped = df.groupby(district_col)
     
-    for district_id, group_df in grouped:
-        district_id_str = str(district_id).strip()
+    for group_key, group_df in grouped:
+        # group_key is now already an ID (1-5) for boroughs due to normalization above
+        district_id_str = str(group_key).strip()
         
         # Calculate tonnages
         mgp = group_df[mgp_col].sum()
@@ -471,8 +523,10 @@ def calculate_diversion_rates(df: pd.DataFrame, district_type: str) -> List[Dist
         organic = group_df[organic_col].sum()
         refuse = group_df[refuse_col].sum()
         
-        # Total diverted = recycled (mgp + paper) + composted (organic)
-        diverted_tonnage = mgp + paper + organic
+        # Separated tonnages
+        recycled_tonnage = mgp + paper  # Recycled (MGP + Paper)
+        composted_tonnage = organic  # Composted (Organic)
+        diverted_tonnage = recycled_tonnage + composted_tonnage  # Total diverted
         
         # Total waste = diverted + refuse
         total_tonnage = diverted_tonnage + refuse
@@ -480,8 +534,10 @@ def calculate_diversion_rates(df: pd.DataFrame, district_type: str) -> List[Dist
         # Calculate diversion rate: (Recycled + Composted) / Total × 100
         if total_tonnage > 0:
             diversion_rate = (diverted_tonnage / total_tonnage) * 100
+            compost_rate = (composted_tonnage / total_tonnage) * 100
         else:
             diversion_rate = 0.0
+            compost_rate = 0.0
         
         # Get most recent month
         month_cols = [c for c in df.columns if 'MONTH' in c.upper() or 'MONTH' in c]
@@ -502,7 +558,9 @@ def calculate_diversion_rates(df: pd.DataFrame, district_type: str) -> List[Dist
             district_name=f"{district_type.capitalize()} District {district_id_str}",
             diversion_rate=round(diversion_rate, 2),
             total_tonnage=round(total_tonnage, 2),
-            recycled_tonnage=round(diverted_tonnage, 2),  # Total diverted (recycled + composted)
+            recycled_tonnage=round(recycled_tonnage, 2),  # Recycled (MGP + Paper)
+            composted_tonnage=round(composted_tonnage, 2),  # Composted (Organic)
+            compost_rate=round(compost_rate, 2),  # Compost rate percentage
             month_year=str(recent_month) if recent_month else None,
             projection_6mo=round(projections['6mo'], 2) if projections else None,
             projection_12mo=round(projections['12mo'], 2) if projections else None,
