@@ -63,45 +63,20 @@ def is_allowed_origin(origin: Optional[str]) -> bool:
     
     if origin in allowed_origins:
         return True
-    # Check regex pattern for lovable.app subdomains
-    pattern = r"https://.*\.lovable\.app"
-    if re.match(pattern, origin):
+    # Check regex pattern for lovable.app and lovableproject.com subdomains
+    lovable_pattern = r"https://.*\.lovable\.app"
+    lovableproject_pattern = r"https://.*\.lovableproject\.com"
+    if re.match(lovable_pattern, origin) or re.match(lovableproject_pattern, origin):
         return True
     # For development, allow localhost with any port
     if origin.startswith("http://localhost:") or origin.startswith("https://localhost:"):
         return True
     return False
 
-# Add middleware to ensure CORS headers are always added to all responses
-class CORSEnforcerMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        origin = request.headers.get("origin")
-        cors_origin = origin if origin and is_allowed_origin(origin) else None
-        
-        response = await call_next(request)
-        
-        # Add CORS headers to all responses if origin is allowed
-        # This ensures headers are present even if CORSMiddleware doesn't add them
-        if cors_origin:
-            # Only add if not already present (to avoid duplication)
-            if "Access-Control-Allow-Origin" not in response.headers:
-                response.headers["Access-Control-Allow-Origin"] = cors_origin
-            if "Access-Control-Allow-Credentials" not in response.headers:
-                response.headers["Access-Control-Allow-Credentials"] = "true"
-            if "Access-Control-Allow-Methods" not in response.headers:
-                response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, HEAD"
-            if "Access-Control-Allow-Headers" not in response.headers:
-                response.headers["Access-Control-Allow-Headers"] = "*"
-            if "Access-Control-Expose-Headers" not in response.headers:
-                response.headers["Access-Control-Expose-Headers"] = "*"
-        
-        return response
-
-# Add CORS middleware first
-app.add_middleware(CORSEnforcerMiddleware)
+# Add CORS middleware with permissive settings
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"https://.*\.lovable\.app",  # Allow all lovable.app subdomains
+    allow_origin_regex=r"https://.*\.(lovable\.app|lovableproject\.com)",  # Allow all lovable subdomains
     allow_origins=all_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"],
@@ -110,12 +85,46 @@ app.add_middleware(
     max_age=3600,
 )
 
+# Add middleware to ensure CORS headers are always added to all responses (runs after CORSMiddleware)
+class CORSEnforcerMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        origin = request.headers.get("origin")
+        
+        # Check if origin is allowed
+        cors_origin = None
+        if origin:
+            if is_allowed_origin(origin):
+                cors_origin = origin
+            else:
+                # Log for debugging
+                logger.warning(f"Origin not in allowed list: {origin}")
+        
+        response = await call_next(request)
+        
+        # Always add CORS headers to all responses if origin is allowed
+        # This ensures headers are present even if CORSMiddleware doesn't add them
+        if cors_origin:
+            # Override any existing headers to ensure they're set
+            response.headers["Access-Control-Allow-Origin"] = cors_origin
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, HEAD"
+            response.headers["Access-Control-Allow-Headers"] = "*"
+            response.headers["Access-Control-Expose-Headers"] = "*"
+        elif origin:
+            # Log if origin is present but not allowed (for debugging)
+            logger.debug(f"Origin present but not allowed: {origin}")
+        
+        return response
+
+# Add CORS enforcer middleware AFTER CORSMiddleware (so it runs last on responses)
+app.add_middleware(CORSEnforcerMiddleware)
+
 # Exception handlers to ensure CORS headers are added to all errors
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """Handle validation errors with CORS headers."""
     origin = request.headers.get("origin")
-    cors_origin = origin if is_allowed_origin(origin) else None
+    cors_origin = origin if origin and is_allowed_origin(origin) else None
     headers = {}
     if cors_origin:
         headers = {
@@ -123,7 +132,9 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             "Access-Control-Allow-Credentials": "true",
             "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD",
             "Access-Control-Allow-Headers": "*",
+            "Access-Control-Expose-Headers": "*",
         }
+    logger.info(f"Validation error - Origin: {origin}, CORS origin: {cors_origin}, Headers: {headers}")
     return JSONResponse(
         status_code=422,
         content={"detail": exc.errors(), "body": exc.body},
@@ -134,7 +145,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 async def http_exception_handler(request: Request, exc: HTTPException):
     """Handle HTTP exceptions with CORS headers."""
     origin = request.headers.get("origin")
-    cors_origin = origin if is_allowed_origin(origin) else None
+    cors_origin = origin if origin and is_allowed_origin(origin) else None
     headers = {}
     if cors_origin:
         headers = {
@@ -142,7 +153,9 @@ async def http_exception_handler(request: Request, exc: HTTPException):
             "Access-Control-Allow-Credentials": "true",
             "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD",
             "Access-Control-Allow-Headers": "*",
+            "Access-Control-Expose-Headers": "*",
         }
+    logger.info(f"HTTP exception ({exc.status_code}) - Origin: {origin}, CORS origin: {cors_origin}, Headers: {headers}")
     return JSONResponse(
         status_code=exc.status_code,
         content={"detail": exc.detail},
@@ -153,7 +166,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 async def general_exception_handler(request: Request, exc: Exception):
     """Handle all other exceptions with CORS headers."""
     origin = request.headers.get("origin")
-    cors_origin = origin if is_allowed_origin(origin) else None
+    cors_origin = origin if origin and is_allowed_origin(origin) else None
     logger.error(f"Unhandled exception: {exc}", exc_info=True)
     headers = {}
     if cors_origin:
@@ -162,12 +175,14 @@ async def general_exception_handler(request: Request, exc: Exception):
             "Access-Control-Allow-Credentials": "true",
             "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD",
             "Access-Control-Allow-Headers": "*",
+            "Access-Control-Expose-Headers": "*",
         }
+    logger.info(f"General exception - Origin: {origin}, CORS origin: {cors_origin}, Headers: {headers}")
     return JSONResponse(
         status_code=500,
         content={"detail": "Internal server error"},
         headers=headers
-)
+    )
 
 
 # ----- Schemas -----
