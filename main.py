@@ -431,11 +431,13 @@ async def fetch_district_coordinates() -> Dict[str, Dict[str, float]]:
         # The dataset ID from ArcGIS Hub URL can be used to construct the REST endpoint
         # Common patterns for ArcGIS Hub datasets
         urls_to_try = [
-            # ArcGIS Hub API v3 - direct GeoJSON download
+            # ArcGIS Hub API v3 - direct GeoJSON download (most reliable)
             "https://opendata.arcgis.com/api/v3/datasets/nyc-community-districts/downloads/data?format=geojson&spatialRefId=4326",
-            # ArcGIS REST API query endpoint
+        ]
+        
+        # Also try REST API endpoints with simpler queries
+        rest_endpoints = [
             "https://services.arcgis.com/fYRg49etfc5qh5Jv/arcgis/rest/services/nyc_community_districts/FeatureServer/0/query",
-            # Alternative REST endpoint pattern
             "https://services.arcgis.com/fYRg49etfc5qh5Jv/arcgis/rest/services/Community_Districts/FeatureServer/0/query",
         ]
         
@@ -446,19 +448,8 @@ async def fetch_district_coordinates() -> Dict[str, Dict[str, float]]:
                 logger.info(f"Attempting to fetch district boundaries from: {url}")
                 
                 async with httpx.AsyncClient(timeout=30.0) as client:
-                    if "query" in url:
-                        # ArcGIS REST API query endpoint
-                        params = {
-                            "where": "1=1",  # Get all features
-                            "outFields": "BoroCD,geometry",
-                            "f": "geojson",
-                            "outSR": 4326,  # WGS84
-                        }
-                        response = await client.get(url, params=params)
-                    else:
-                        # Direct GeoJSON download
-                        response = await client.get(url)
-                    
+                    # Direct GeoJSON download (ArcGIS Hub API v3)
+                    response = await client.get(url)
                     response.raise_for_status()
                     data = response.json()
                     
@@ -567,7 +558,7 @@ async def fetch_district_coordinates() -> Dict[str, Dict[str, float]]:
                                     district_coords[district_num] = coord_data
                     
                     if district_coords:
-                        logger.info(f"Successfully fetched {len(district_coords)} district coordinates")
+                        logger.info(f"Successfully fetched {len(district_coords)} district coordinates from {url}")
                         _district_coords_cache = district_coords
                         return district_coords
                     else:
@@ -576,6 +567,84 @@ async def fetch_district_coordinates() -> Dict[str, Dict[str, float]]:
                         
             except Exception as e:
                 logger.warning(f"Error fetching from {url}: {e}")
+                continue
+        
+        # If ArcGIS Hub API failed, try REST API endpoints with simpler queries
+        logger.info("ArcGIS Hub API failed, trying REST API endpoints")
+        for rest_url in rest_endpoints:
+            try:
+                logger.info(f"Attempting REST API endpoint: {rest_url}")
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    # Try minimal parameters first
+                    params = {
+                        "where": "1=1",
+                        "f": "json",  # Use JSON format for REST API
+                        "outSR": 4326,
+                    }
+                    response = await client.get(rest_url, params=params)
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    # Process ArcGIS REST API JSON format
+                    if "features" in data:
+                        features = data.get("features", [])
+                        logger.info(f"REST API returned {len(features)} features")
+                        for feature in features:
+                            attrs = feature.get("attributes", {})
+                            geometry = feature.get("geometry", {})
+                            
+                            district_id = (
+                                attrs.get("BoroCD") or
+                                attrs.get("boro_cd") or
+                                attrs.get("Boro_CD") or
+                                attrs.get("cd") or
+                                attrs.get("CD") or
+                                None
+                            )
+                            
+                            if district_id is None:
+                                continue
+                            
+                            district_id_str = str(district_id).strip()
+                            
+                            # Convert ArcGIS geometry to GeoJSON-like format for centroid calculation
+                            if geometry.get("rings"):
+                                rings = geometry.get("rings", [])
+                                if rings and len(rings) > 0:
+                                    exterior_ring = rings[0]
+                                    geo_json_like = {
+                                        "type": "Polygon",
+                                        "coordinates": [exterior_ring]
+                                    }
+                                    centroid = calculate_centroid(geo_json_like)
+                                else:
+                                    centroid = None
+                            elif geometry.get("x") is not None and geometry.get("y") is not None:
+                                centroid = (float(geometry["x"]), float(geometry["y"]))
+                            else:
+                                centroid = None
+                            
+                            if centroid:
+                                lng, lat = centroid
+                                coord_data = {
+                                    "latitude": lat,
+                                    "longitude": lng
+                                }
+                                district_coords[district_id_str] = coord_data
+                                
+                                # Also store with district number only
+                                if len(district_id_str) >= 3:
+                                    district_num = district_id_str[-2:] if len(district_id_str) > 2 else district_id_str[-1]
+                                    district_num = str(int(district_num)) if district_num.isdigit() else district_num
+                                    district_coords[district_num] = coord_data
+                        
+                        if district_coords:
+                            logger.info(f"Successfully fetched {len(district_coords)} district coordinates from REST API")
+                            _district_coords_cache = district_coords
+                            return district_coords
+                        
+            except Exception as e:
+                logger.warning(f"Error fetching from REST API {rest_url}: {e}")
                 continue
         
         # If all URLs failed, return empty dict
