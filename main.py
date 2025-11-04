@@ -30,6 +30,7 @@ app.add_middleware(
     allow_origin_regex=r"https://.*\.lovable\.app",
     allow_origins=[
         "https://a74f6327-764b-47f2-8e5a-0cf826e093a1.lovable.app",
+        "https://a74f6327-764b-47f2-8e5a-0cf826e093a1.lovableproject.com",
         "http://localhost:3000",  # for local testing
         "http://localhost:5173",  # common Vite dev server port
     ],
@@ -47,6 +48,7 @@ def is_allowed_origin(origin: Optional[str]) -> bool:
         return False
     allowed_origins = [
         "https://a74f6327-764b-47f2-8e5a-0cf826e093a1.lovable.app",
+        "https://a74f6327-764b-47f2-8e5a-0cf826e093a1.lovableproject.com",
         "http://localhost:3000",
         "http://localhost:5173",
     ]
@@ -332,6 +334,216 @@ _data_cache: Optional[pd.DataFrame] = None
 _cache_timestamp: Optional[datetime] = None
 CACHE_DURATION_HOURS = 1  # Cache data for 1 hour
 
+# NYC Community Districts Boundaries from ArcGIS Hub
+# Source: https://hub.arcgis.com/datasets/DCP::nyc-community-districts
+NYC_COMMUNITY_DISTRICTS_ARCGIS_URL = "https://services.arcgis.com/fYRg49etfc5qh5Jv/arcgis/rest/services/nyc_community_districts/FeatureServer/0/query"
+_district_coords_cache: Optional[Dict[str, Dict[str, float]]] = None  # {district_id: {lat: float, lng: float}}
+
+def calculate_centroid(geometry: Dict) -> Optional[tuple[float, float]]:
+    """
+    Calculate centroid (longitude, latitude) from ArcGIS geometry.
+    Handles polygons, multipolygons, and other geometry types.
+    Returns (longitude, latitude) or None if unable to calculate.
+    """
+    try:
+        if geometry.get("type") == "Polygon":
+            rings = geometry.get("coordinates", [])
+            if not rings:
+                return None
+            # Use the first ring (exterior ring) for centroid calculation
+            coords = rings[0]
+        elif geometry.get("type") == "MultiPolygon":
+            polygons = geometry.get("coordinates", [])
+            if not polygons:
+                return None
+            # Use the first polygon's exterior ring
+            coords = polygons[0][0] if polygons else []
+        else:
+            # Try to extract coordinates directly
+            coords = geometry.get("coordinates", [])
+            if isinstance(coords[0], (list, tuple)) and len(coords[0]) > 0:
+                if isinstance(coords[0][0], (list, tuple)):
+                    # Nested coordinates - use first ring
+                    coords = coords[0]
+        
+        if not coords:
+            return None
+        
+        # Calculate centroid as average of all coordinates
+        lng_sum = 0.0
+        lat_sum = 0.0
+        count = 0
+        
+        for coord in coords:
+            if isinstance(coord, (list, tuple)) and len(coord) >= 2:
+                lng_sum += float(coord[0])
+                lat_sum += float(coord[1])
+                count += 1
+        
+        if count == 0:
+            return None
+        
+        return (lng_sum / count, lat_sum / count)
+    
+    except Exception as e:
+        logger.warning(f"Error calculating centroid: {e}")
+        return None
+
+async def fetch_district_coordinates() -> Dict[str, Dict[str, float]]:
+    """
+    Fetch community district boundaries from ArcGIS Hub and calculate centroids.
+    Returns a dictionary mapping district_id to {latitude: float, longitude: float}.
+    
+    District IDs are formatted as "101", "102", etc. (first digit = borough, next 2 = district).
+    """
+    global _district_coords_cache
+    
+    # Return cached data if available (coordinates don't change often)
+    if _district_coords_cache is not None:
+        return _district_coords_cache
+    
+    try:
+        # Try different ArcGIS REST API endpoints
+        # The dataset ID from ArcGIS Hub URL can be used to construct the REST endpoint
+        # Common patterns for ArcGIS Hub datasets
+        urls_to_try = [
+            # ArcGIS Hub API v3 - direct GeoJSON download
+            "https://opendata.arcgis.com/api/v3/datasets/nyc-community-districts/downloads/data?format=geojson&spatialRefId=4326",
+            # ArcGIS REST API query endpoint
+            "https://services.arcgis.com/fYRg49etfc5qh5Jv/arcgis/rest/services/nyc_community_districts/FeatureServer/0/query",
+            # Alternative REST endpoint pattern
+            "https://services.arcgis.com/fYRg49etfc5qh5Jv/arcgis/rest/services/Community_Districts/FeatureServer/0/query",
+        ]
+        
+        district_coords = {}
+        
+        for url in urls_to_try:
+            try:
+                logger.info(f"Attempting to fetch district boundaries from: {url}")
+                
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    if "query" in url:
+                        # ArcGIS REST API query endpoint
+                        params = {
+                            "where": "1=1",  # Get all features
+                            "outFields": "BoroCD,geometry",
+                            "f": "geojson",
+                            "outSR": 4326,  # WGS84
+                        }
+                        response = await client.get(url, params=params)
+                    else:
+                        # Direct GeoJSON download
+                        response = await client.get(url)
+                    
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    # Handle GeoJSON format
+                    if data.get("type") == "FeatureCollection":
+                        features = data.get("features", [])
+                        for feature in features:
+                            props = feature.get("properties", {})
+                            geometry = feature.get("geometry", {})
+                            
+                            # Try different property names for district ID
+                            district_id = (
+                                props.get("BoroCD") or
+                                props.get("boro_cd") or
+                                props.get("Boro_CD") or
+                                props.get("cd") or
+                                props.get("CD") or
+                                props.get("BoroCD1") or
+                                None
+                            )
+                            
+                            if district_id is None:
+                                continue
+                            
+                            # Convert to string and normalize format
+                            district_id_str = str(district_id).strip()
+                            
+                            # Calculate centroid
+                            centroid = calculate_centroid(geometry)
+                            if centroid:
+                                lng, lat = centroid
+                                district_coords[district_id_str] = {
+                                    "latitude": lat,
+                                    "longitude": lng
+                                }
+                    
+                    # Handle ArcGIS REST API response format
+                    elif "features" in data:
+                        features = data.get("features", [])
+                        for feature in features:
+                            attrs = feature.get("attributes", {})
+                            geometry = feature.get("geometry", {})
+                            
+                            district_id = (
+                                attrs.get("BoroCD") or
+                                attrs.get("boro_cd") or
+                                attrs.get("Boro_CD") or
+                                attrs.get("cd") or
+                                attrs.get("CD") or
+                                None
+                            )
+                            
+                            if district_id is None:
+                                continue
+                            
+                            district_id_str = str(district_id).strip()
+                            
+                            # Convert ArcGIS geometry to GeoJSON-like format for centroid calculation
+                            if geometry.get("rings"):
+                                # Polygon geometry - ArcGIS rings are arrays of [x, y] pairs
+                                # For WGS84 (SRID 4326), x = longitude, y = latitude
+                                # Convert rings to GeoJSON polygon format
+                                rings = geometry.get("rings", [])
+                                if rings and len(rings) > 0:
+                                    # Use the first ring (exterior ring) for centroid
+                                    exterior_ring = rings[0]
+                                    geo_json_like = {
+                                        "type": "Polygon",
+                                        "coordinates": [exterior_ring]  # GeoJSON format expects array of rings
+                                    }
+                                    centroid = calculate_centroid(geo_json_like)
+                                else:
+                                    centroid = None
+                            elif geometry.get("x") is not None and geometry.get("y") is not None:
+                                # Point geometry - use directly
+                                # ArcGIS REST API returns x=longitude, y=latitude for WGS84
+                                centroid = (float(geometry["x"]), float(geometry["y"]))
+                            else:
+                                centroid = None
+                            
+                            if centroid:
+                                lng, lat = centroid
+                                district_coords[district_id_str] = {
+                                    "latitude": lat,
+                                    "longitude": lng
+                                }
+                    
+                    if district_coords:
+                        logger.info(f"Successfully fetched {len(district_coords)} district coordinates")
+                        _district_coords_cache = district_coords
+                        return district_coords
+                    else:
+                        logger.warning(f"No district coordinates found from {url}")
+                        continue
+                        
+            except Exception as e:
+                logger.warning(f"Error fetching from {url}: {e}")
+                continue
+        
+        # If all URLs failed, return empty dict
+        logger.warning("Unable to fetch district coordinates from any source")
+        _district_coords_cache = {}
+        return {}
+        
+    except Exception as e:
+        logger.error(f"Error fetching district coordinates: {e}", exc_info=True)
+        _district_coords_cache = {}
+        return {}
+
 async def fetch_nyc_tonnage_data() -> pd.DataFrame:
     """
     Fetch NYC DSNY monthly tonnage data from SOCRATA API.
@@ -394,15 +606,24 @@ async def fetch_nyc_tonnage_data() -> pd.DataFrame:
             return _data_cache
         raise HTTPException(status_code=503, detail=f"Unable to fetch NYC data: {str(e)}")
 
-def calculate_diversion_rates(df: pd.DataFrame, district_type: str) -> List[DistrictDiversionData]:
+def calculate_diversion_rates(
+    df: pd.DataFrame, 
+    district_type: str, 
+    district_coords: Optional[Dict[str, Dict[str, float]]] = None
+) -> List[DistrictDiversionData]:
     """
     Calculate diversion rates from NYC tonnage data by district type.
     
     Diversion Rate = (Recycled tons + Composted tons) / Total waste tons × 100
     Where:
     - Recycled = MGPTONSCOLLECTED (metal/glass/plastic) + PAPERTONSCOLLECTED (paper)
-    - Composted = RESORGANICSTONS (organics/compost)
+    - Composted = RESORGANICSTONS + SCHOOLORGANICTONS + LEAVESORGANICSTONS + OTHERORGANICSTONS (all organic sources)
     - Total = Recycled + Composted + REFUSETONSCOLLECTED (trash)
+    
+    Args:
+        df: DataFrame with NYC tonnage data
+        district_type: Type of district ('community' or 'borough')
+        district_coords: Optional dictionary mapping district_id to {latitude: float, longitude: float}
     """
     if df.empty:
         return []
@@ -442,6 +663,9 @@ def calculate_diversion_rates(df: pd.DataFrame, district_type: str) -> List[Dist
     mgp_col = df_columns_dict.get("MGPTONSCOLLECTED", None)
     paper_col = df_columns_dict.get("PAPERTONSCOLLECTED", None)
     organic_col = df_columns_dict.get("RESORGANICSTONS", None)
+    school_organic_col = df_columns_dict.get("SCHOOLORGANICTONS", None)
+    leaves_organic_col = df_columns_dict.get("LEAVESORGANICSTONS", None)
+    other_organic_col = df_columns_dict.get("OTHERORGANICSTONS", None)
     refuse_col = df_columns_dict.get("REFUSETONSCOLLECTED", None)
     
     if not mgp_col or not paper_col or not organic_col or not refuse_col:
@@ -453,6 +677,18 @@ def calculate_diversion_rates(df: pd.DataFrame, district_type: str) -> List[Dist
         ] if not val]
         logger.error(f"Missing required columns: {missing}. Available columns: {list(df.columns)}")
         return []
+    
+    # Optional additional organic columns - log if they exist
+    organic_cols_list = [organic_col]
+    if school_organic_col:
+        organic_cols_list.append(school_organic_col)
+        logger.info(f"Found SCHOOLORGANICTONS column: {school_organic_col}")
+    if leaves_organic_col:
+        organic_cols_list.append(leaves_organic_col)
+        logger.info(f"Found LEAVESORGANICSTONS column: {leaves_organic_col}")
+    if other_organic_col:
+        organic_cols_list.append(other_organic_col)
+        logger.info(f"Found OTHERORGANICSTONS column: {other_organic_col}")
     
     # Borough name to ID mapping (NYC standard)
     borough_name_to_id = {
@@ -500,7 +736,16 @@ def calculate_diversion_rates(df: pd.DataFrame, district_type: str) -> List[Dist
             logger.warning(f"No borough values found in {district_col}")
     
     # Convert tonnage columns to numeric (but not district_col if we're using names)
-    for col in [mgp_col, paper_col, organic_col, refuse_col]:
+    columns_to_convert = [mgp_col, paper_col, organic_col, refuse_col]
+    # Add optional organic columns if they exist
+    if school_organic_col:
+        columns_to_convert.append(school_organic_col)
+    if leaves_organic_col:
+        columns_to_convert.append(leaves_organic_col)
+    if other_organic_col:
+        columns_to_convert.append(other_organic_col)
+    
+    for col in columns_to_convert:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
     
@@ -523,9 +768,18 @@ def calculate_diversion_rates(df: pd.DataFrame, district_type: str) -> List[Dist
         organic = group_df[organic_col].sum()
         refuse = group_df[refuse_col].sum()
         
+        # Calculate composted tonnage from all organic sources
+        composted_tonnage = organic  # RESORGANICSTONS
+        # Add additional organic sources if available
+        if school_organic_col and school_organic_col in group_df.columns:
+            composted_tonnage += group_df[school_organic_col].sum()
+        if leaves_organic_col and leaves_organic_col in group_df.columns:
+            composted_tonnage += group_df[leaves_organic_col].sum()
+        if other_organic_col and other_organic_col in group_df.columns:
+            composted_tonnage += group_df[other_organic_col].sum()
+        
         # Separated tonnages
         recycled_tonnage = mgp + paper  # Recycled (MGP + Paper)
-        composted_tonnage = organic  # Composted (Organic)
         diverted_tonnage = recycled_tonnage + composted_tonnage  # Total diverted
         
         # Total waste = diverted + refuse
@@ -551,7 +805,19 @@ def calculate_diversion_rates(df: pd.DataFrame, district_type: str) -> List[Dist
             recent_month = None
         
         # Calculate projections using simple linear trend
-        projections = calculate_projections(group_df, mgp_col, paper_col, organic_col, refuse_col)
+        projections = calculate_projections(
+            group_df, mgp_col, paper_col, organic_col, refuse_col,
+            school_organic_col, leaves_organic_col, other_organic_col
+        )
+        
+        # Get coordinates for this district if available
+        latitude = None
+        longitude = None
+        if district_coords:
+            coords = district_coords.get(district_id_str)
+            if coords:
+                latitude = coords.get("latitude")
+                longitude = coords.get("longitude")
         
         district_data.append(DistrictDiversionData(
             district_id=district_id_str,
@@ -564,8 +830,8 @@ def calculate_diversion_rates(df: pd.DataFrame, district_type: str) -> List[Dist
             month_year=str(recent_month) if recent_month else None,
             projection_6mo=round(projections['6mo'], 2) if projections else None,
             projection_12mo=round(projections['12mo'], 2) if projections else None,
-            latitude=None,  # Could be enriched with district coordinates
-            longitude=None,
+            latitude=latitude,
+            longitude=longitude,
         ))
     
     # Sort by district_id
@@ -573,12 +839,15 @@ def calculate_diversion_rates(df: pd.DataFrame, district_type: str) -> List[Dist
     
     return district_data
 
-def calculate_projections(group_df: pd.DataFrame, mgp_col: str, paper_col: str, organic_col: str, refuse_col: str) -> Optional[Dict[str, float]]:
+def calculate_projections(group_df: pd.DataFrame, mgp_col: str, paper_col: str, organic_col: str, refuse_col: str,
+                          school_organic_col: Optional[str] = None, leaves_organic_col: Optional[str] = None,
+                          other_organic_col: Optional[str] = None) -> Optional[Dict[str, float]]:
     """
     Calculate 6-month and 12-month projections using linear trend analysis.
     Returns projected diversion rates.
     
     Diversion Rate = (Recycled + Composted) / Total × 100
+    Where Composted includes all organic sources (RESORGANICSTONS + SCHOOLORGANICTONS + LEAVESORGANICSTONS + OTHERORGANICSTONS)
     """
     if mgp_col not in group_df.columns or paper_col not in group_df.columns or \
        organic_col not in group_df.columns or refuse_col not in group_df.columns:
@@ -592,8 +861,17 @@ def calculate_projections(group_df: pd.DataFrame, mgp_col: str, paper_col: str, 
         
         # Calculate monthly diversion rates
         group_df = group_df.copy()
-        # Diverted = MGP + Paper + Organic (recycled + composted)
-        group_df['diverted'] = group_df[mgp_col] + group_df[paper_col] + group_df[organic_col]
+        # Calculate total organic from all available sources
+        total_organic = group_df[organic_col]  # RESORGANICSTONS
+        if school_organic_col and school_organic_col in group_df.columns:
+            total_organic = total_organic + group_df[school_organic_col]
+        if leaves_organic_col and leaves_organic_col in group_df.columns:
+            total_organic = total_organic + group_df[leaves_organic_col]
+        if other_organic_col and other_organic_col in group_df.columns:
+            total_organic = total_organic + group_df[other_organic_col]
+        
+        # Diverted = MGP + Paper + Total Organic (recycled + composted)
+        group_df['diverted'] = group_df[mgp_col] + group_df[paper_col] + total_organic
         # Total = Diverted + Refuse
         group_df['total'] = group_df['diverted'] + group_df[refuse_col]
         # Diversion rate = (Diverted / Total) × 100
@@ -626,7 +904,16 @@ def calculate_projections(group_df: pd.DataFrame, mgp_col: str, paper_col: str, 
         logger.warning(f"Error calculating projections: {e}")
         # Return current average as fallback
         if all(col in group_df.columns for col in [mgp_col, paper_col, organic_col, refuse_col]):
-            diverted = group_df[mgp_col].sum() + group_df[paper_col].sum() + group_df[organic_col].sum()
+            # Calculate total organic from all available sources
+            total_organic = group_df[organic_col].sum()  # RESORGANICSTONS
+            if school_organic_col and school_organic_col in group_df.columns:
+                total_organic += group_df[school_organic_col].sum()
+            if leaves_organic_col and leaves_organic_col in group_df.columns:
+                total_organic += group_df[leaves_organic_col].sum()
+            if other_organic_col and other_organic_col in group_df.columns:
+                total_organic += group_df[other_organic_col].sum()
+            
+            diverted = group_df[mgp_col].sum() + group_df[paper_col].sum() + total_organic
             total = diverted + group_df[refuse_col].sum()
             current_rate = (diverted / total * 100) if total > 0 else 0
             return {'6mo': current_rate, '12mo': current_rate}
@@ -967,7 +1254,7 @@ async def neighborhood_diversion_rates(
     Diversion rate = (Recycled tons + Composted tons) / Total waste tons × 100
     Where:
     - Recycled = MGPTONSCOLLECTED (metal/glass/plastic) + PAPERTONSCOLLECTED (paper)
-    - Composted = RESORGANICSTONS (organics/compost)
+    - Composted = RESORGANICSTONS + SCHOOLORGANICTONS + LEAVESORGANICSTONS + OTHERORGANICSTONS (all organic sources)
     - Total = Recycled + Composted + REFUSETONSCOLLECTED (trash)
     
     Returns diversion rates and projections for each district, suitable for Mapbox visualization.
@@ -995,8 +1282,20 @@ async def neighborhood_diversion_rates(
                 metadata={"error": "No data available"}
             )
         
+        # Fetch district coordinates for community districts (for map visualization)
+        district_coords = None
+        if district_type_lower == "community":
+            try:
+                district_coords = await fetch_district_coordinates()
+                if district_coords:
+                    logger.info(f"Fetched coordinates for {len(district_coords)} community districts")
+                else:
+                    logger.warning("No district coordinates available - map visualization will not have lat/lng")
+            except Exception as e:
+                logger.warning(f"Error fetching district coordinates: {e} - continuing without coordinates")
+        
         # Calculate diversion rates
-        districts = calculate_diversion_rates(df, district_type_lower)
+        districts = calculate_diversion_rates(df, district_type_lower, district_coords)
         
         if not districts:
             logger.warning(f"No districts found for district_type: {district_type_lower}")
