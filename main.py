@@ -1486,6 +1486,34 @@ async def test_district_coordinates():
             "has_coordinates": False
         }
 
+@app.post("/test-emissions-calculation")
+def test_emissions_calculation(data: Payload):
+    """Test endpoint to verify emissions calculations are working correctly."""
+    try:
+        # Call the actual calculation endpoint
+        result = calculate_emissions(data)
+        
+        # Return a detailed breakdown for debugging
+        return {
+            "ok": True,
+            "response": result.model_dump(),
+            "totals_breakdown": {
+                "landfill_kgco2e": result.totals.landfill_kgco2e,
+                "compost_kgco2e": result.totals.compost_kgco2e,
+                "avoided_kgco2e": result.totals.avoided_kgco2e,
+                "avoided_kgco2e_food": result.totals.avoided_kgco2e_food,
+                "avoided_kgco2e_packaging": result.totals.avoided_kgco2e_packaging,
+            },
+            "items_count": len(result.items),
+            "sample_item": result.items[0].model_dump() if result.items else None
+        }
+    except Exception as e:
+        logger.error(f"Test emissions calculation error: {e}", exc_info=True)
+        return {
+            "ok": False,
+            "error": str(e)
+        }
+
 @app.options("/community-districts-geojson")
 async def community_districts_geojson_options(request: Request):
     """Handle CORS preflight for community-districts-geojson endpoint."""
