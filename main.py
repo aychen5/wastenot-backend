@@ -4,10 +4,10 @@ import re
 import logging
 from typing import List, Optional, Dict, Literal
 from datetime import datetime, timedelta
-from fastapi import FastAPI, HTTPException, Response, Request, Query
+from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from supabase import create_client, Client
 import httpx
@@ -1450,6 +1450,14 @@ async def test_district_coordinates():
             "has_coordinates": False
         }
 
+@app.options("/community-districts-geojson")
+async def community_districts_geojson_options(request: Request):
+    """Handle CORS preflight for community-districts-geojson endpoint."""
+    origin = request.headers.get("origin")
+    logger.info(f"OPTIONS request received for /community-districts-geojson from {origin}")
+    response = Response(status_code=204)
+    return response
+
 @app.get("/community-districts-geojson")
 async def get_community_districts_geojson():
     """
@@ -1460,7 +1468,11 @@ async def get_community_districts_geojson():
     
     # Return cached data if available
     if _district_boundaries_cache is not None:
-        return _district_boundaries_cache
+        import json
+        return Response(
+            content=json.dumps(_district_boundaries_cache),
+            media_type="application/geo+json"
+        )
     
     try:
         # Try ArcGIS Hub API v3 first (most reliable)
@@ -1476,7 +1488,12 @@ async def get_community_districts_geojson():
             if data.get("type") == "FeatureCollection":
                 _district_boundaries_cache = data
                 logger.info(f"Successfully fetched GeoJSON with {len(data.get('features', []))} districts")
-                return data
+                # Return as GeoJSON with proper content type
+                import json
+                return Response(
+                    content=json.dumps(data),
+                    media_type="application/geo+json"
+                )
             else:
                 logger.warning(f"Unexpected response format: {data.get('type')}")
                 raise HTTPException(status_code=500, detail="Invalid GeoJSON format from ArcGIS")
