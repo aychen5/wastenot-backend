@@ -190,6 +190,7 @@ class ComputeResponse(BaseModel):
 class DistrictDiversionData(BaseModel):
     district_id: str
     district_name: str
+    boro_cd: Optional[str] = None  # Full BoroCD format (e.g., "306" for Brooklyn 6) for matching with GeoJSON
     diversion_rate: float  # percentage (0-100)
     total_tonnage: float  # total waste collected in tons
     recycled_tonnage: float  # recycled waste (MGP + Paper) in tons
@@ -903,9 +904,29 @@ def calculate_diversion_rates(
                 latitude = coords.get("latitude")
                 longitude = coords.get("longitude")
         
+        # Calculate possible BoroCD formats for matching with GeoJSON
+        # BoroCD format: first digit = borough (1-5), next 2 digits = district number
+        # Since we don't know which borough each district belongs to from tonnage data alone,
+        # we'll generate all possible BoroCD formats for this district number
+        district_num = int(district_id_str) if district_id_str.isdigit() else None
+        possible_boro_cds = []
+        primary_boro_cd = None
+        
+        if district_num and 1 <= district_num <= 18:
+            # Try all 5 boroughs (1=Manhattan, 2=Bronx, 3=Brooklyn, 4=Queens, 5=Staten Island)
+            for borough in range(1, 6):
+                # Format as 3-digit BoroCD (e.g., "106" for Manhattan 6, "306" for Brooklyn 6, "315" for Brooklyn 15)
+                padded_district = str(district_num).zfill(2)
+                boro_cd = f"{borough}{padded_district}"
+                possible_boro_cds.append(boro_cd)
+            
+            # Use the first one as primary (Manhattan) - frontend should try all matches
+            primary_boro_cd = possible_boro_cds[0] if possible_boro_cds else None
+        
         district_data.append(DistrictDiversionData(
             district_id=district_id_str,
             district_name=f"Community District {district_id_str}",
+            boro_cd=primary_boro_cd,  # Primary BoroCD for matching (will try all 5 boroughs if needed)
             diversion_rate=round(diversion_rate, 2),
             total_tonnage=round(total_tonnage, 2),
             recycled_tonnage=round(recycled_tonnage, 2),  # Recycled (MGP + Paper)
@@ -1382,11 +1403,24 @@ async def neighborhood_diversion_rates():
         # Get cache timestamp
         last_updated = _cache_timestamp.isoformat() if _cache_timestamp else datetime.now().isoformat()
         
+        # Create BoroCD lookup map: BoroCD -> district_id
+        # This helps frontend match GeoJSON features (which use BoroCD) to diversion rate data
+        boro_cd_lookup = {}
+        for district in districts:
+            district_num = int(district.district_id) if district.district_id.isdigit() else None
+            if district_num and 1 <= district_num <= 18:
+                # Generate all possible BoroCD formats for this district
+                for borough in range(1, 6):
+                    padded_district = str(district_num).zfill(2)
+                    boro_cd = f"{borough}{padded_district}"
+                    boro_cd_lookup[boro_cd] = district.district_id
+        
         return NeighborhoodDiversionResponse(
             district_type=district_type,
             districts=districts,
             data_source="NYC OpenData (DSNY Monthly Tonnage Data)",
             last_updated=last_updated,
+            boro_cd_lookup=boro_cd_lookup,
             metadata={
                 "total_districts": len(districts),
                 "dataset_id": NYC_DSNY_TONNAGE_DATASET_ID,
