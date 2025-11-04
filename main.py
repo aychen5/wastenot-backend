@@ -4,15 +4,17 @@ import re
 import logging
 from typing import List, Optional, Dict, Literal
 from datetime import datetime, timedelta
-from fastapi import FastAPI, HTTPException, Response, Request, Query
+from fastapi import FastAPI, HTTPException, Request, Query
+from starlette.requests import Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from supabase import create_client, Client
 import httpx
 import pandas as pd
 import numpy as np
+import json
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -1450,40 +1452,93 @@ async def test_district_coordinates():
             "has_coordinates": False
         }
 
+@app.options("/community-districts-geojson")
+async def community_districts_geojson_options(request: Request):
+    """Handle CORS preflight for community-districts-geojson endpoint."""
+    origin = request.headers.get("origin")
+    logger.info(f"OPTIONS request received for /community-districts-geojson from {origin}")
+    response = Response(status_code=204)
+    return response
+
 @app.get("/community-districts-geojson")
 async def get_community_districts_geojson():
     """
     Get full GeoJSON boundaries for NYC community districts.
     Returns a GeoJSON FeatureCollection that can be used directly in map visualizations.
+    Reads from local file: community_districts.geojson
     """
     global _district_boundaries_cache
     
     # Return cached data if available
     if _district_boundaries_cache is not None:
-        return _district_boundaries_cache
+        return Response(
+            content=json.dumps(_district_boundaries_cache),
+            media_type="application/geo+json"
+        )
+    
+    # Try multiple possible filenames
+    possible_filenames = [
+        "NYC_Community_Districts_147499644259232207.geojson",
+        "community_districts.geojson",
+        "nyc_community_districts.geojson"
+    ]
     
     try:
-        # Try ArcGIS Hub API v3 first (most reliable)
-        url = "https://opendata.arcgis.com/api/v3/datasets/nyc-community-districts/downloads/data?format=geojson&spatialRefId=4326"
+        # Try to load from local file first
+        geojson_file_path = None
+        for filename in possible_filenames:
+            file_path = os.path.join(os.path.dirname(__file__), filename)
+            if os.path.exists(file_path):
+                geojson_file_path = file_path
+                break
         
-        logger.info(f"Fetching community district boundaries from: {url}")
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            data = response.json()
+        if geojson_file_path:
+            logger.info(f"Loading GeoJSON from local file: {geojson_file_path}")
+            with open(geojson_file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
             
             # Validate it's a GeoJSON FeatureCollection
             if data.get("type") == "FeatureCollection":
                 _district_boundaries_cache = data
-                logger.info(f"Successfully fetched GeoJSON with {len(data.get('features', []))} districts")
-                return data
+                logger.info(f"Successfully loaded GeoJSON with {len(data.get('features', []))} districts from local file")
+                return Response(
+                    content=json.dumps(data),
+                    media_type="application/geo+json"
+                )
             else:
-                logger.warning(f"Unexpected response format: {data.get('type')}")
-                raise HTTPException(status_code=500, detail="Invalid GeoJSON format from ArcGIS")
+                logger.warning(f"Invalid GeoJSON format in local file: {data.get('type')}")
+                raise HTTPException(status_code=500, detail="Invalid GeoJSON format in local file")
+        else:
+            # Fallback: Try to fetch from ArcGIS Hub API if local file doesn't exist
+            logger.warning(f"Local GeoJSON file not found. Tried: {possible_filenames}. Attempting to fetch from ArcGIS")
+            url = "https://opendata.arcgis.com/api/v3/datasets/nyc-community-districts/downloads/data?format=geojson&spatialRefId=4326"
+            
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                data = response.json()
                 
+                # Validate it's a GeoJSON FeatureCollection
+                if data.get("type") == "FeatureCollection":
+                    _district_boundaries_cache = data
+                    logger.info(f"Successfully fetched GeoJSON with {len(data.get('features', []))} districts from ArcGIS")
+                    return Response(
+                        content=json.dumps(data),
+                        media_type="application/geo+json"
+                    )
+                else:
+                    logger.warning(f"Unexpected response format: {data.get('type')}")
+                    raise HTTPException(status_code=500, detail="Invalid GeoJSON format from ArcGIS")
+                
+    except FileNotFoundError:
+        logger.error(f"GeoJSON file not found. Tried: {possible_filenames}")
+        raise HTTPException(status_code=404, detail="Community districts GeoJSON file not found. Please add the GeoJSON file to the project root.")
+    except json.JSONDecodeError as e:
+        logger.error(f"Error parsing GeoJSON file: {e}")
+        raise HTTPException(status_code=500, detail=f"Error parsing GeoJSON file: {str(e)}")
     except httpx.HTTPStatusError as e:
         logger.error(f"HTTP error fetching GeoJSON: {e}")
         raise HTTPException(status_code=503, detail=f"Unable to fetch district boundaries: {str(e)}")
     except Exception as e:
-        logger.error(f"Error fetching district boundaries: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error fetching district boundaries: {str(e)}")
+        logger.error(f"Error loading district boundaries: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error loading district boundaries: {str(e)}")
