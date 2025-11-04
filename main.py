@@ -6,6 +6,7 @@ from typing import List, Optional, Dict, Literal
 from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException, Request, Query
 from starlette.requests import Request
+from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
@@ -71,7 +72,33 @@ def is_allowed_origin(origin: Optional[str]) -> bool:
         return True
     return False
 
-# Add CORS middleware
+# Add middleware to ensure CORS headers are always added to all responses
+class CORSEnforcerMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        origin = request.headers.get("origin")
+        cors_origin = origin if origin and is_allowed_origin(origin) else None
+        
+        response = await call_next(request)
+        
+        # Add CORS headers to all responses if origin is allowed
+        # This ensures headers are present even if CORSMiddleware doesn't add them
+        if cors_origin:
+            # Only add if not already present (to avoid duplication)
+            if "Access-Control-Allow-Origin" not in response.headers:
+                response.headers["Access-Control-Allow-Origin"] = cors_origin
+            if "Access-Control-Allow-Credentials" not in response.headers:
+                response.headers["Access-Control-Allow-Credentials"] = "true"
+            if "Access-Control-Allow-Methods" not in response.headers:
+                response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, HEAD"
+            if "Access-Control-Allow-Headers" not in response.headers:
+                response.headers["Access-Control-Allow-Headers"] = "*"
+            if "Access-Control-Expose-Headers" not in response.headers:
+                response.headers["Access-Control-Expose-Headers"] = "*"
+        
+        return response
+
+# Add CORS middleware first
+app.add_middleware(CORSEnforcerMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"https://.*\.lovable\.app",  # Allow all lovable.app subdomains
@@ -1038,8 +1065,18 @@ async def meal_emissions_options(request: Request):
     """Handle CORS preflight for meal-emissions endpoint."""
     origin = request.headers.get("origin")
     logger.info(f"OPTIONS request received for /meal-emissions from {origin}")
-    # CORS middleware should handle headers, just return empty response
-    response = Response(status_code=204)
+    # Explicitly add CORS headers
+    cors_origin = origin if is_allowed_origin(origin) else None
+    headers = {}
+    if cors_origin:
+        headers = {
+            "Access-Control-Allow-Origin": cors_origin,
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age": "3600",
+        }
+    response = Response(status_code=204, headers=headers)
     return response
 
 
@@ -1215,8 +1252,18 @@ async def calculate_emissions_options(request: Request):
     """Handle CORS preflight for calculate-emissions endpoint."""
     origin = request.headers.get("origin")
     logger.info(f"OPTIONS request received for /calculate-emissions from {origin}")
-    # CORS middleware should handle headers, just return empty response
-    response = Response(status_code=204)
+    # Explicitly add CORS headers
+    cors_origin = origin if is_allowed_origin(origin) else None
+    headers = {}
+    if cors_origin:
+        headers = {
+            "Access-Control-Allow-Origin": cors_origin,
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age": "3600",
+        }
+    response = Response(status_code=204, headers=headers)
     return response
 
 
@@ -1342,7 +1389,18 @@ async def neighborhood_diversion_rates_options(request: Request):
     """Handle CORS preflight for neighborhood-diversion-rates endpoint."""
     origin = request.headers.get("origin")
     logger.info(f"OPTIONS request received for /neighborhood-diversion-rates from {origin}")
-    response = Response(status_code=204)
+    # Explicitly add CORS headers
+    cors_origin = origin if is_allowed_origin(origin) else None
+    headers = {}
+    if cors_origin:
+        headers = {
+            "Access-Control-Allow-Origin": cors_origin,
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age": "3600",
+        }
+    response = Response(status_code=204, headers=headers)
     return response
 
 @app.get("/neighborhood-diversion-rates", response_model=NeighborhoodDiversionResponse)
@@ -1519,7 +1577,18 @@ async def community_districts_geojson_options(request: Request):
     """Handle CORS preflight for community-districts-geojson endpoint."""
     origin = request.headers.get("origin")
     logger.info(f"OPTIONS request received for /community-districts-geojson from {origin}")
-    response = Response(status_code=204)
+    # Explicitly add CORS headers
+    cors_origin = origin if is_allowed_origin(origin) else None
+    headers = {}
+    if cors_origin:
+        headers = {
+            "Access-Control-Allow-Origin": cors_origin,
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age": "3600",
+        }
+    response = Response(status_code=204, headers=headers)
     return response
 
 @app.get("/community-districts-geojson")
