@@ -8,8 +8,6 @@ from fastapi import FastAPI, HTTPException, Response, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from fastapi.middleware.base import BaseHTTPMiddleware
-from starlette.types import ASGIApp
 from pydantic import BaseModel, Field
 from supabase import create_client, Client
 import httpx
