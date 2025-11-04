@@ -35,6 +35,7 @@ ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "").split(",") if os.environ
 default_origins = [
     "https://a74f6327-764b-47f2-8e5a-0cf826e093a1.lovable.app",
     "https://a74f6327-764b-47f2-8e5a-0cf826e093a1.lovableproject.com",
+    "https://waste-not-nyc-app.com",  # live production site
     "http://localhost:3000",  # for local testing
     "http://localhost:5173",  # common Vite dev server port
     "http://localhost:8080",  # additional common dev port
@@ -54,6 +55,7 @@ def is_allowed_origin(origin: Optional[str]) -> bool:
     default_origins = [
         "https://a74f6327-764b-47f2-8e5a-0cf826e093a1.lovable.app",
         "https://a74f6327-764b-47f2-8e5a-0cf826e093a1.lovableproject.com",
+        "https://waste-not-nyc-app.com",  # live production site
         "http://localhost:3000",
         "http://localhost:5173",
         "http://localhost:8080",
@@ -67,6 +69,9 @@ def is_allowed_origin(origin: Optional[str]) -> bool:
     lovable_pattern = r"https://.*\.lovable\.app"
     lovableproject_pattern = r"https://.*\.lovableproject\.com"
     if re.match(lovable_pattern, origin) or re.match(lovableproject_pattern, origin):
+        return True
+    # Allow waste-not-nyc-app.com domain (with or without www)
+    if origin.startswith("https://waste-not-nyc-app.com") or origin.startswith("https://www.waste-not-nyc-app.com"):
         return True
     # For development, allow localhost with any port
     if origin.startswith("http://localhost:") or origin.startswith("https://localhost:"):
@@ -1268,7 +1273,7 @@ async def calculate_emissions_options(request: Request):
     origin = request.headers.get("origin")
     logger.info(f"OPTIONS request received for /calculate-emissions from {origin}")
     # Explicitly add CORS headers
-    cors_origin = origin if is_allowed_origin(origin) else None
+    cors_origin = origin if origin and is_allowed_origin(origin) else None
     headers = {}
     if cors_origin:
         headers = {
@@ -1278,6 +1283,8 @@ async def calculate_emissions_options(request: Request):
             "Access-Control-Allow-Headers": "*",
             "Access-Control-Max-Age": "3600",
         }
+    else:
+        logger.warning(f"OPTIONS request from non-allowed origin: {origin}")
     response = Response(status_code=204, headers=headers)
     return response
 
