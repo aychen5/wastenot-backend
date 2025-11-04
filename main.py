@@ -8,8 +8,6 @@ from fastapi import FastAPI, HTTPException, Response, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from fastapi.middleware.base import BaseHTTPMiddleware
-from starlette.types import ASGIApp
 from pydantic import BaseModel, Field
 from supabase import create_client, Client
 import httpx
@@ -420,6 +418,7 @@ async def fetch_district_coordinates() -> Dict[str, Dict[str, float]]:
     Returns a dictionary mapping district_id to {latitude: float, longitude: float}.
     
     District IDs are formatted as "101", "102", etc. (first digit = borough, next 2 = district).
+    Also stores coordinates under district number only (e.g., "1", "2") for flexible matching.
     """
     global _district_coords_cache
     
@@ -491,10 +490,20 @@ async def fetch_district_coordinates() -> Dict[str, Dict[str, float]]:
                             centroid = calculate_centroid(geometry)
                             if centroid:
                                 lng, lat = centroid
-                                district_coords[district_id_str] = {
+                                coord_data = {
                                     "latitude": lat,
                                     "longitude": lng
                                 }
+                                # Store with full BoroCD format (e.g., "101")
+                                district_coords[district_id_str] = coord_data
+                                
+                                # Also store with district number only (e.g., "1") for flexible matching
+                                # Extract district number from BoroCD (last 2 digits)
+                                if len(district_id_str) >= 3:
+                                    district_num = district_id_str[-2:] if len(district_id_str) > 2 else district_id_str[-1]
+                                    # Remove leading zero if present
+                                    district_num = str(int(district_num)) if district_num.isdigit() else district_num
+                                    district_coords[district_num] = coord_data
                     
                     # Handle ArcGIS REST API response format
                     elif "features" in data:
@@ -542,10 +551,20 @@ async def fetch_district_coordinates() -> Dict[str, Dict[str, float]]:
                             
                             if centroid:
                                 lng, lat = centroid
-                                district_coords[district_id_str] = {
+                                coord_data = {
                                     "latitude": lat,
                                     "longitude": lng
                                 }
+                                # Store with full BoroCD format (e.g., "101")
+                                district_coords[district_id_str] = coord_data
+                                
+                                # Also store with district number only (e.g., "1") for flexible matching
+                                # Extract district number from BoroCD (last 2 digits)
+                                if len(district_id_str) >= 3:
+                                    district_num = district_id_str[-2:] if len(district_id_str) > 2 else district_id_str[-1]
+                                    # Remove leading zero if present
+                                    district_num = str(int(district_num)) if district_num.isdigit() else district_num
+                                    district_coords[district_num] = coord_data
                     
                     if district_coords:
                         logger.info(f"Successfully fetched {len(district_coords)} district coordinates")
@@ -633,11 +652,10 @@ async def fetch_nyc_tonnage_data() -> pd.DataFrame:
 
 def calculate_diversion_rates(
     df: pd.DataFrame, 
-    district_type: str, 
     district_coords: Optional[Dict[str, Dict[str, float]]] = None
 ) -> List[DistrictDiversionData]:
     """
-    Calculate diversion rates from NYC tonnage data by district type.
+    Calculate diversion rates from NYC tonnage data for community districts.
     
     Diversion Rate = (Recycled tons + Composted tons) / Total waste tons × 100
     Where:
@@ -647,21 +665,14 @@ def calculate_diversion_rates(
     
     Args:
         df: DataFrame with NYC tonnage data
-        district_type: Type of district ('community' or 'borough')
         district_coords: Optional dictionary mapping district_id to {latitude: float, longitude: float}
     """
     if df.empty:
         return []
     
-    # Map district type to column names
-    district_column_map = {
-        "community": ["COMMUNITYDISTRICT", "cd", "community_district"],
-        "borough": ["BOROUGH", "BOROUGH_ID"],
-    }
-    
-    # Find the appropriate district column (case-insensitive search)
+    # Find the community district column (case-insensitive search)
     district_col = None
-    possible_cols = district_column_map.get(district_type.lower(), [])
+    possible_cols = ["COMMUNITYDISTRICT", "cd", "community_district"]
     df_columns_upper = [c.upper() for c in df.columns]
     
     for col in possible_cols:
@@ -675,12 +686,12 @@ def calculate_diversion_rates(
             break
     
     if district_col is None:
-        # Try to find any district-related column (case-insensitive)
-        district_cols = [c for c in df.columns if 'COMMUNITYDISTRICT' in c.upper() or 'CD' in c.upper() or 'BOROUGH' in c.upper()]
+        # Try to find any community district-related column (case-insensitive)
+        district_cols = [c for c in df.columns if 'COMMUNITYDISTRICT' in c.upper() or 'CD' in c.upper()]
         if district_cols:
             district_col = district_cols[0]
         else:
-            logger.warning(f"No district column found for type {district_type}")
+            logger.warning("No community district column found")
             return []
     
     # Find columns (case-insensitive) - use specific column names from NYC dataset
@@ -715,52 +726,7 @@ def calculate_diversion_rates(
         organic_cols_list.append(other_organic_col)
         logger.info(f"Found OTHERORGANICSTONS column: {other_organic_col}")
     
-    # Borough name to ID mapping (NYC standard)
-    borough_name_to_id = {
-        'Manhattan': '1',
-        'Bronx': '2',
-        'Brooklyn': '3',
-        'Queens': '4',
-        'Staten Island': '5',
-    }
-    
-    # For borough type, normalize BOROUGH column values to IDs (1-5)
-    if district_type.lower() == 'borough' and district_col and district_col in df.columns:
-        # Check what values are in the BOROUGH column before converting to numeric
-        unique_boroughs = df[district_col].dropna().unique()
-        logger.info(f"Found unique borough values in {district_col}: {unique_boroughs[:10]}")  # Log first 10
-        
-        # Check if values are names (strings) or IDs (numbers)
-        sample_val = unique_boroughs[0] if len(unique_boroughs) > 0 else None
-        if sample_val is not None:
-            # If the value is a string (borough name), convert to ID
-            if isinstance(sample_val, str) and not sample_val.replace('.', '').replace('-', '').isdigit():
-                # Values are borough names - create a mapping column
-                logger.info(f"BOROUGH column contains names, converting to IDs")
-                df['_borough_id'] = df[district_col].apply(
-                    lambda x: borough_name_to_id.get(str(x).strip(), None) 
-                    or next((bid for name, bid in borough_name_to_id.items() 
-                            if name.lower() == str(x).strip().lower()), None)
-                    or str(x).strip()
-                )
-                # Replace district_col with the ID column
-                district_col = '_borough_id'
-            else:
-                # Values might be numeric IDs or need normalization
-                logger.info(f"BOROUGH column contains numeric values")
-                # Try to convert to numeric and check if they're 1-5
-                df[district_col] = pd.to_numeric(df[district_col], errors='coerce')
-                unique_numeric = df[district_col].dropna().unique()
-                # Check if all values are 0 or invalid
-                if len(unique_numeric) > 0 and all(v == 0 or pd.isna(v) for v in unique_numeric):
-                    logger.warning(f"All borough IDs are 0 or invalid - values: {unique_numeric}")
-                else:
-                    # Convert to string for consistency
-                    df[district_col] = df[district_col].apply(lambda x: str(int(x)) if pd.notna(x) and x > 0 else '0')
-        else:
-            logger.warning(f"No borough values found in {district_col}")
-    
-    # Convert tonnage columns to numeric (but not district_col if we're using names)
+    # Convert tonnage columns to numeric
     columns_to_convert = [mgp_col, paper_col, organic_col, refuse_col]
     # Add optional organic columns if they exist
     if school_organic_col:
@@ -774,8 +740,8 @@ def calculate_diversion_rates(
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
     
-    # If district_col is numeric, convert it
-    if district_col in df.columns and district_col != '_borough_id':
+    # Convert district column to numeric
+    if district_col in df.columns:
         df[district_col] = pd.to_numeric(df[district_col], errors='coerce').fillna(0)
     
     # Group by district and calculate totals
@@ -784,7 +750,6 @@ def calculate_diversion_rates(
     grouped = df.groupby(district_col)
     
     for group_key, group_df in grouped:
-        # group_key is now already an ID (1-5) for boroughs due to normalization above
         district_id_str = str(group_key).strip()
         
         # Calculate tonnages
@@ -836,17 +801,39 @@ def calculate_diversion_rates(
         )
         
         # Get coordinates for this district if available
+        # Try multiple matching strategies:
+        # 1. Exact match (e.g., "1" -> "1")
+        # 2. BoroCD format (e.g., "1" -> try "101", "201", "301", "401", "501")
+        # 3. Padded format (e.g., "1" -> "01" -> try "101", "201", etc.)
         latitude = None
         longitude = None
         if district_coords:
+            # Try exact match first
             coords = district_coords.get(district_id_str)
+            
+            # If not found and district_id looks like a single number, try BoroCD formats
+            if not coords and district_id_str.isdigit():
+                # Try with borough prefixes (1=Manhattan, 2=Bronx, 3=Brooklyn, 4=Queens, 5=Staten Island)
+                for borough in range(1, 6):
+                    # Try with 2-digit district number (e.g., "01", "10")
+                    padded_district = district_id_str.zfill(2)
+                    boro_cd = f"{borough}{padded_district}"
+                    if boro_cd in district_coords:
+                        coords = district_coords[boro_cd]
+                        break
+                    # Also try without padding (e.g., "11" -> "11", "12" -> "12")
+                    boro_cd = f"{borough}{district_id_str}"
+                    if boro_cd in district_coords:
+                        coords = district_coords[boro_cd]
+                        break
+            
             if coords:
                 latitude = coords.get("latitude")
                 longitude = coords.get("longitude")
         
         district_data.append(DistrictDiversionData(
             district_id=district_id_str,
-            district_name=f"{district_type.capitalize()} District {district_id_str}",
+            district_name=f"Community District {district_id_str}",
             diversion_rate=round(diversion_rate, 2),
             total_tonnage=round(total_tonnage, 2),
             recycled_tonnage=round(recycled_tonnage, 2),  # Recycled (MGP + Paper)
@@ -1266,15 +1253,9 @@ async def neighborhood_diversion_rates_options(request: Request):
     return response
 
 @app.get("/neighborhood-diversion-rates", response_model=NeighborhoodDiversionResponse)
-async def neighborhood_diversion_rates(
-    district_type: str = Query(
-        default="community",
-        description="Type of district: community or borough",
-        regex="^(community|borough)$"
-    )
-):
+async def neighborhood_diversion_rates():
     """
-    Calculate diversion rates by district type using NYC's monthly tonnage data.
+    Calculate diversion rates for NYC community districts using monthly tonnage data.
     
     Diversion rate = (Recycled tons + Composted tons) / Total waste tons × 100
     Where:
@@ -1282,25 +1263,20 @@ async def neighborhood_diversion_rates(
     - Composted = RESORGANICSTONS + SCHOOLORGANICTONS + LEAVESORGANICSTONS + OTHERORGANICSTONS (all organic sources)
     - Total = Recycled + Composted + REFUSETONSCOLLECTED (trash)
     
-    Returns diversion rates and projections for each district, suitable for Mapbox visualization.
+    Returns diversion rates and projections for each community district, suitable for Mapbox visualization.
     """
     try:
-        # Validate district_type
-        district_type_lower = district_type.lower()
-        if district_type_lower not in ["community", "borough"]:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid district_type. Must be one of: community, borough"
-            )
+        # Always use community districts
+        district_type = "community"
         
         # Fetch NYC tonnage data
-        logger.info(f"Fetching diversion rates for district_type: {district_type_lower}")
+        logger.info("Fetching diversion rates for community districts")
         df = await fetch_nyc_tonnage_data()
         
         if df.empty:
             logger.warning("No data available from NYC OpenData")
             return NeighborhoodDiversionResponse(
-                district_type=district_type_lower,
+                district_type=district_type,
                 districts=[],
                 data_source="NYC OpenData (DSNY Monthly Tonnage Data)",
                 last_updated=None,
@@ -1309,23 +1285,22 @@ async def neighborhood_diversion_rates(
         
         # Fetch district coordinates for community districts (for map visualization)
         district_coords = None
-        if district_type_lower == "community":
-            try:
-                district_coords = await fetch_district_coordinates()
-                if district_coords:
-                    logger.info(f"Fetched coordinates for {len(district_coords)} community districts")
-                else:
-                    logger.warning("No district coordinates available - map visualization will not have lat/lng")
-            except Exception as e:
-                logger.warning(f"Error fetching district coordinates: {e} - continuing without coordinates")
+        try:
+            district_coords = await fetch_district_coordinates()
+            if district_coords:
+                logger.info(f"Fetched coordinates for {len(district_coords)} community districts")
+            else:
+                logger.warning("No district coordinates available - map visualization will not have lat/lng")
+        except Exception as e:
+            logger.warning(f"Error fetching district coordinates: {e} - continuing without coordinates")
         
         # Calculate diversion rates
-        districts = calculate_diversion_rates(df, district_type_lower, district_coords)
+        districts = calculate_diversion_rates(df, district_coords)
         
         if not districts:
-            logger.warning(f"No districts found for district_type: {district_type_lower}")
+            logger.warning("No community districts found")
             return NeighborhoodDiversionResponse(
-                district_type=district_type_lower,
+                district_type=district_type,
                 districts=[],
                 data_source="NYC OpenData (DSNY Monthly Tonnage Data)",
                 last_updated=_cache_timestamp.isoformat() if _cache_timestamp else None,
@@ -1336,7 +1311,7 @@ async def neighborhood_diversion_rates(
         last_updated = _cache_timestamp.isoformat() if _cache_timestamp else datetime.now().isoformat()
         
         return NeighborhoodDiversionResponse(
-            district_type=district_type_lower,
+            district_type=district_type,
             districts=districts,
             data_source="NYC OpenData (DSNY Monthly Tonnage Data)",
             last_updated=last_updated,
