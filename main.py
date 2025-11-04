@@ -8,6 +8,8 @@ from fastapi import FastAPI, HTTPException, Response, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp
 from pydantic import BaseModel, Field
 from supabase import create_client, Client
 import httpx
@@ -25,38 +27,61 @@ sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 # ----- FastAPI app + CORS -----
 app = FastAPI(title="WasteNotNYC Emissions API", version="1.1.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=r"https://.*\.lovable\.app",
-    allow_origins=[
+
+# Get allowed origins from environment or use defaults
+ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "").split(",") if os.environ.get("ALLOWED_ORIGINS") else []
+# Add default origins if not in env
+default_origins = [
+    "https://a74f6327-764b-47f2-8e5a-0cf826e093a1.lovable.app",
+    "https://a74f6327-764b-47f2-8e5a-0cf826e093a1.lovableproject.com",
+    "http://localhost:3000",  # for local testing
+    "http://localhost:5173",  # common Vite dev server port
+    "http://localhost:8080",  # additional common dev port
+]
+
+# Combine env origins with defaults, removing empty strings
+all_origins = [origin for origin in ALLOWED_ORIGINS + default_origins if origin.strip()]
+
+# Helper function to check if origin is allowed (must be defined before middleware)
+def is_allowed_origin(origin: Optional[str]) -> bool:
+    """Check if origin is in allowed list."""
+    if not origin:
+        return False
+    
+    # Get allowed origins from environment or use defaults
+    env_origins = os.environ.get("ALLOWED_ORIGINS", "").split(",") if os.environ.get("ALLOWED_ORIGINS") else []
+    default_origins = [
         "https://a74f6327-764b-47f2-8e5a-0cf826e093a1.lovable.app",
         "https://a74f6327-764b-47f2-8e5a-0cf826e093a1.lovableproject.com",
-        "http://localhost:3000",  # for local testing
-        "http://localhost:5173",  # common Vite dev server port
-    ],
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://localhost:8080",
+    ]
+    
+    allowed_origins = [o.strip() for o in env_origins + default_origins if o.strip()]
+    
+    if origin in allowed_origins:
+        return True
+    # Check regex pattern for lovable.app subdomains
+    pattern = r"https://.*\.lovable\.app"
+    if re.match(pattern, origin):
+        return True
+    # For development, allow localhost with any port
+    if origin.startswith("http://localhost:") or origin.startswith("https://localhost:"):
+        return True
+    return False
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"https://.*\.lovable\.app",  # Allow all lovable.app subdomains
+    allow_origins=all_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"],
     allow_headers=["*"],
     expose_headers=["*"],
     max_age=3600,
 )
-
-# Helper function to check if origin is allowed
-def is_allowed_origin(origin: Optional[str]) -> bool:
-    """Check if origin is in allowed list."""
-    if not origin:
-        return False
-    allowed_origins = [
-        "https://a74f6327-764b-47f2-8e5a-0cf826e093a1.lovable.app",
-        "https://a74f6327-764b-47f2-8e5a-0cf826e093a1.lovableproject.com",
-        "http://localhost:3000",
-        "http://localhost:5173",
-    ]
-    if origin in allowed_origins:
-        return True
-    # Check regex pattern
-    pattern = r"https://.*\.lovable\.app"
-    return bool(re.match(pattern, origin))
 
 # Exception handlers to ensure CORS headers are added to all errors
 @app.exception_handler(RequestValidationError)
@@ -1358,4 +1383,24 @@ def test_db():
             "ok": False,
             "error": str(e),
             "table_exists": False
+        }
+
+@app.get("/test-district-coordinates")
+async def test_district_coordinates():
+    """Test endpoint to verify district coordinates are being fetched from ArcGIS."""
+    try:
+        coords = await fetch_district_coordinates()
+        sample_coords = dict(list(coords.items())[:5]) if coords else {}
+        return {
+            "ok": True,
+            "total_districts": len(coords),
+            "sample_coordinates": sample_coords,
+            "has_coordinates": len(coords) > 0
+        }
+    except Exception as e:
+        logger.error(f"District coordinates test error: {e}", exc_info=True)
+        return {
+            "ok": False,
+            "error": str(e),
+            "has_coordinates": False
         }
